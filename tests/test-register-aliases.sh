@@ -24,7 +24,6 @@ cmp "$ISH_PROFILE_FILE" "$TMP/first-run" || { echo 'FAIL: not idempotent' >&2; e
 [ "$(grep -c '^alias syncapps=' "$ISH_PROFILE_FILE")" = 1 ]
 [ "$(grep -c '^alias syncapp=' "$ISH_PROFILE_FILE")" = 1 ]
 [ "$(grep -c '^alias gamp=' "$ISH_PROFILE_FILE")" = 1 ]
-[ "$(grep -c '^alias pwacloud=' "$ISH_PROFILE_FILE")" = 1 ]
 grep -Fq "alias other='echo unchanged'" "$ISH_PROFILE_FILE"
 grep -Fq "$ROOT/scripts/aliases/sync-apps.sh" "$ISH_PROFILE_FILE"
 grep -Fq "$ROOT/scripts/aliases/sync-app.sh" "$ISH_PROFILE_FILE"
@@ -35,10 +34,9 @@ grep -Fq 'alias other=' "$ROOT/current_aliases.txt"
 grep -Fq 'alias syncapps=' "$ROOT/current_aliases.txt"
 git -C "$ROOT" check-ignore -q current_aliases.txt
 # Confirm the registered aliases actually work after the profile is sourced.
-sh -c '. "$1"; alias syncapps; alias syncapp; alias gamp; alias pwacloud' sh "$ISH_PROFILE_FILE" > "$TMP/active"
+sh -c '. "$1"; alias syncapps; alias syncapp; alias gamp' sh "$ISH_PROFILE_FILE" > "$TMP/active"
 grep -Fq 'syncapps=' "$TMP/active"
 grep -Fq 'syncapp=' "$TMP/active"
 grep -Fq 'gamp=' "$TMP/active"
-grep -Fq 'pwacloud=' "$TMP/active"
 
 echo 'PASS: registration, idempotency, preserved aliases, snapshot, and ignore.'

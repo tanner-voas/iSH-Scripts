@@ -29,5 +29,3 @@ No changes are made by simply installing the files. Running `syncapps` or `synca
 ## Tests
 
 Run `sh tests/test-sync.sh` and `sh tests/test-register-aliases.sh`. Tests use temporary shell profiles and repositories; `test-register-aliases.sh` regenerates only the ignored `current_aliases.txt` in the test checkout.
-
-- `pwacloud`: manage the shared Google Drive profile Worker from iSH (`pwacloud help`, `pwacloud doctor`, `pwacloud setup`, `pwacloud deploy`, `pwacloud status`). See `GoogleCloud/README.md`.
