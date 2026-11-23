@@ -2,6 +2,14 @@
 
 Small, POSIX-shell Git workflows for the iSH app workspace at `/mnt/wcopy/apps/`.
 
+## Set up aliases
+
+Run `sh scripts/register_aliases.sh` from this repository (or pass its full path).
+It installs/updates the three aliases in `~/.profile`, preserves other aliases, and
+creates an ignored, local `current_aliases.txt` listing persistent aliases found
+in that profile. The script is safe to rerun. Activate aliases in an existing
+terminal with `. ~/.profile`; new iSH login shells read the profile normally.
+
 ## Commands
 
 - `syncapps` — detects only direct-child Git repositories; checks **all** for tracked changes, fetches and verifies **all**, then safely fast-forwards each to `origin/main`.
@@ -14,6 +22,10 @@ Sync refuses to overwrite staged or unstaged tracked changes (including deletion
 
 ## Install
 
-Extract this ZIP into `/mnt/wcopy/apps/` to create `/mnt/wcopy/apps/iSH-Scripts/`, keeping the `.git` directory. Copy `workspace/README.md` to `/mnt/wcopy/apps/README.md`, then update the shell aliases in `/root/.profile` to refer to `scripts/aliases/`. The supplied ChatGPT installation block also registers this directory as globally safe and pushes `main` to the GitHub remote.
+Extract the ZIP to `/mnt/wcopy/apps/iSH-Scripts/` with the `.git` directory included. Run `sh /mnt/wcopy/apps/iSH-Scripts/scripts/register_aliases.sh` and `. ~/.profile`. Optionally copy `workspace/README.md` to `/mnt/wcopy/apps/README.md`. Register the repo with `git config --global --add safe.directory /mnt/wcopy/apps/iSH-Scripts` if iSH reports dubious ownership; configure a remote and push when ready.
 
 No changes are made by simply installing the files. Running `syncapps` or `syncapp` modifies repository checkouts when fast-forwarding is possible. Running `gamp` creates commits and pushes.
+
+## Tests
+
+Run `sh tests/test-sync.sh` and `sh tests/test-register-aliases.sh`. Tests use temporary shell profiles and repositories; `test-register-aliases.sh` regenerates only the ignored `current_aliases.txt` in the test checkout.
