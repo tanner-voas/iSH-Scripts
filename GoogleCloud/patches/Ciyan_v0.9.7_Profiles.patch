@@ -1,0 +1,1032 @@
+From 51f916f3371efb5b2b27278ccb161216f679f3d0 Mon Sep 17 00:00:00 2001
+From: ChatGPT <chatgpt@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 04:46:44 +0000
+Subject: [PATCH] Ciyan v0.9.7: shared profiles and automatic cloud
+ synchronization
+
+---
+ .github/workflows/update-google-drive.yml |  54 +++++++++
+ .gitmodules                               |   3 +
+ app.js                                    |  41 +++++--
+ backup-versions.js                        |   3 +-
+ cloud-profiles.js                         | 129 ++++++++++++++++++++++
+ index.html                                |   2 +-
+ package.json                              |   2 +-
+ package.py                                |   9 +-
+ shared/google-drive                       |   1 +
+ storage.js                                |   8 +-
+ styles.css                                |   3 +
+ sw.standalone.template.js                 |   2 +
+ tests/deployment-targets.test.js          |   2 +-
+ tests/header-v096.test.js                 |   4 +-
+ tests/panlong-v095.test.js                |   2 +-
+ tests/standalone-deployment.test.js       |   4 +-
+ tests/ui-smoke.test.js                    |  13 ++-
+ tests/v053.test.js                        |  12 +-
+ tests/v055.test.js                        |   6 +-
+ tests/v061.test.js                        |   2 +-
+ tests/v062.test.js                        |   2 +-
+ tests/v064.test.js                        |   4 +-
+ tests/v065.test.js                        |   2 +-
+ tests/v066.test.js                        |   4 +-
+ tests/v067.test.js                        |   4 +-
+ tests/v068.test.js                        |   2 +-
+ tests/v069.test.js                        |   4 +-
+ tests/v078.test.js                        |   2 +-
+ tests/v079.test.js                        |   4 +-
+ tests/v0810.test.js                       |   4 +-
+ tests/v0811.test.js                       |   4 +-
+ tests/v0812.test.js                       |   4 +-
+ tests/v0814.test.js                       |   4 +-
+ tests/v085.test.js                        |   2 +-
+ tests/v086.test.js                        |   4 +-
+ tests/v087.test.js                        |   4 +-
+ tests/v088.test.js                        |   4 +-
+ worker.js                                 |  10 ++
+ wrangler.jsonc                            |   4 +-
+ 39 files changed, 308 insertions(+), 66 deletions(-)
+ create mode 100644 .github/workflows/update-google-drive.yml
+ create mode 100644 .gitmodules
+ create mode 100644 cloud-profiles.js
+ create mode 160000 shared/google-drive
+ create mode 100644 worker.js
+
+diff --git a/.github/workflows/update-google-drive.yml b/.github/workflows/update-google-drive.yml
+new file mode 100644
+index 0000000..a69db39
+--- /dev/null
++++ b/.github/workflows/update-google-drive.yml
+@@ -0,0 +1,54 @@
++name: Update PWA Google Drive submodule
++on:
++  repository_dispatch:
++    types: [google-drive-release]
++  workflow_dispatch:
++permissions:
++  contents: write
++concurrency:
++  group: ciyan-shared-dependency
++  cancel-in-progress: false
++jobs:
++  advance-shared:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          submodules: true
++      - name: Advance shared library (latest main wins)
++        env:
++          REQUESTED_SHA: ${{ github.event.client_payload.sha }}
++        shell: bash
++        run: |
++          set -euo pipefail
++          git -C shared/google-drive fetch origin main
++          LATEST="$(git -C shared/google-drive rev-parse FETCH_HEAD)"
++          if [[ -n "$REQUESTED_SHA" && "$LATEST" != "$REQUESTED_SHA" ]]; then
++            echo "A newer shared commit ($LATEST) supersedes request for $REQUESTED_SHA"
++          fi
++          git -C shared/google-drive checkout --detach "$LATEST"
++          node --version
++          (cd shared/google-drive && npm test && npm run check)
++          python3 package.py
++          git config user.name 'github-actions[bot]'
++          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
++          git add shared/google-drive
++          if ! git diff --cached --quiet; then
++            git commit -m "build: pin PWA-GoogleDrive ${LATEST:0:12}"
++            git push origin HEAD:main
++          fi
++          echo "SHARED_SHA=$LATEST" >> "$GITHUB_ENV"
++      - name: Notify AppLauncher coordinator (explicitly; avoid implicit workflow chains)
++        env:
++          TOKEN: ${{ secrets.APP_LAUNCHER_DISPATCH_TOKEN }}
++          SHA: ${{ github.sha }}
++        shell: bash
++        run: |
++          set -euo pipefail
++          if [[ -z "$TOKEN" ]]; then echo '::error::Set APP_LAUNCHER_DISPATCH_TOKEN in Ciyan'; exit 1; fi
++          NEW_SHA="$(git rev-parse HEAD)"
++          jq -n --arg sha "$NEW_SHA" --arg shared "$SHARED_SHA" '{event_type:"ciyan-updated",client_payload:{app:"ciyan",sha:$sha,shared_sha:$shared}}' > /tmp/dispatch.json
++          curl --fail-with-body --silent --show-error --retry 3 -X POST \
++            -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' \
++            -H 'X-GitHub-Api-Version: 2022-11-28' --data-binary @/tmp/dispatch.json \
++            https://api.github.com/repos/tanner-voas/AppLauncher/dispatches
+diff --git a/.gitmodules b/.gitmodules
+new file mode 100644
+index 0000000..d0c0ef8
+--- /dev/null
++++ b/.gitmodules
+@@ -0,0 +1,3 @@
++[submodule "shared/google-drive"]
++	path = shared/google-drive
++	url = https://github.com/tanner-voas/PWA-GoogleDrive.git
+diff --git a/app.js b/app.js
+index 7d07363..36002c4 100644
+--- a/app.js
++++ b/app.js
+@@ -1,4 +1,7 @@
+ import {runUpdateButton,returnToLauncher,hasLauncherHost} from './app-host-bridge.js';
++import {profileButton,installProfileUI} from './shared/google-drive/src/ui.js';
++import {currentProfile} from './shared/google-drive/src/profiles.js';
++import {prepareCiyanProfile,startCiyanSync,changedCiyanData,disconnectCiyanSync,cloudHistory,syncNow,syncLabel,isUploading,isSynced,cloudCurrentRevision} from './cloud-profiles.js';
+ import {voiceTuning,createNarrator,mandarinVoices,voiceDescription} from './reader-speech.js';
+ import {createCloudNarrator,cloudVoices,speechCacheCount,setSpeechCacheLimit,clearSpeechCache} from './reader-cloud-speech.js';
+ import {sealSpeechKey,unlockSpeech} from './speech-vault.js';
+@@ -155,7 +158,7 @@ const isDue=(id,now=Date.now())=>!!state.schedules[id]&&Date.parse(state.schedul
+ const countDue=()=>state.cards.filter(c=>isDue(c.id)).length;
+ const countLearned=()=>state.cards.filter(c=>state.schedules[c.id]?.reps>0).length;
+ const countNew=()=>state.cards.length-countLearned();
+-const backupNeeded=()=>state.revision>state.backedUpRevision;
++const backupNeeded=()=>state.revision>state.backedUpRevision&&state.revision!==cloudCurrentRevision();
+ const countReadyGrammar=()=>modeCounts(state,'grammar').available;
+ const recall=s=>s?(retrievability(s)??0):0;
+ const scoreWord=c=>wordKnowledge(state.schedules[c.id],recall(state.schedules[c.id]));
+@@ -187,7 +190,7 @@ async function change(mutator,shouldRender=true,contentChange=false){
+   // Only copy learning records for a study action. Full dictionary data is
+   // immutable unless an explicit add/edit/delete/master operation requests it.
+   const draft=cloneProgressState(state,contentChange);
+-  try{mutator(draft);draft.appVersion=APP_VERSION;draft.revision=(draft.revision||0)+1;await saveState(draft,state.revision);state=draft;if(shouldRender)render();return true;}
++  try{mutator(draft);draft.appVersion=APP_VERSION;draft.revision=(draft.revision||0)+1;await saveState(draft,state.revision);state=draft;changedCiyanData();if(shouldRender)render();return true;}
+   catch(error){toast(`Not saved: ${error.message}`);return false;}
+   finally{saving=false;}
+ }
+@@ -195,16 +198,17 @@ function shell(content){
+   if(page==='reader'&&reader.isReading())return '<main id="main" class="immersive-reader">'+content+'</main>';
+   const nav=[['study','cards','Study'],['browse','book','Words'],['grammar','layers','Grammar'],['reader','book','Reader'],['stats','chart','Stats']];
+   const hideNav=page==='complete'||!!state.activePractice||(page==='study'&&(state.activeSession||state.activeGrammarSession));
+-  const backupStatus=backupUploading?'saving':backupNeeded()?'unsaved':'saved';
++  const backupStatus=backupUploading||isUploading()?'saving':backupNeeded()?'unsaved':'saved';
+   const hosted=hasLauncherHost();
+   return `<header class="topbar"><div class="brand"><span class="brand-mark">词</span><span class="brand-title"><span class="brand-name">Cíyán <span class="brand-version">v${APP_VERSION}</span></span><small>Words that stay</small></span></div><div class="header-actions">
+-      <button class="icon-btn backup-${backupStatus}" data-action="backup" aria-label="${backupStatus==='saved'?'Backup current (already exported)':backupStatus==='saving'?'Backup uploading':'Backup needed — export progress'}" title="${backupStatus==='saved'?'Last exported state is current':backupStatus==='saving'?'Backup uploading':'New changes since last exported backup'}">${icon('archive')}</button>
++      <button class="icon-btn backup-${backupStatus}" data-action="backup" aria-label="${backupStatus==='saved'?'Current revision backed up':backupStatus==='saving'?'Backup uploading':'Backup needed — export progress'}" title="${backupStatus==='saved'?'Current revision has a confirmed backup':backupStatus==='saving'?'Backup uploading':'New changes since last exported backup'}">${icon('archive')}</button>
+       <button class="icon-btn ${page==='settings'?'header-selected':''}" data-action="navigate" data-page="settings" aria-label="${page==='settings'?'Close settings':'Open settings'}" aria-pressed="${page==='settings'}">${icon('settings')}</button>
++      ${profileButton}
+       <button class="icon-btn header-home" data-action="${hosted?'exit-to-launcher':'reload-app'}" aria-label="${hosted?'Return to My Apps':'Check updates and reload Cíyán'}" title="${hosted?'My Apps':'Refresh Cíyán'}">${icon(hosted?'home':'refresh')}</button></div></header>
+       <main id="main">${content}</main>${hideNav?'':`<nav class="bottom-nav" aria-label="Main navigation">${nav.map(([dest,ico,title])=>
+       `<button class="nav-item ${page===dest?'active':''}" data-action="navigate" data-page="${dest}" aria-label="${title}" ${page===dest?'aria-current="page"':''}>${icon(ico)}<span>${title}</span></button>`).join('')}</nav>`}`;
+ }
+-function backupBanner(){return backupNeeded()?`<div class="backup-banner">${icon('shield')}<p><strong>Changes not backed up.</strong> Your study data is saved locally. Export it to Files to protect it.</p><button data-action="backup">Backup</button></div>`:'';}
++function backupBanner(){return backupNeeded()?`<div class="backup-banner">${icon('shield')}<p><strong>Changes not backed up.</strong> Your study data is saved locally. Export to Files or synchronize with Google Drive to protect it.</p><button data-action="backup">Backup</button></div>`:'';}
+ function availableWordQueue(){
+   const due=state.cards.filter(c=>isDue(c.id)).sort((a,b)=>Date.parse(state.schedules[a.id].dueAt)-Date.parse(state.schedules[b.id].dueAt));
+   const fresh=state.cards.filter(c=>!state.schedules[c.id]);
+@@ -732,7 +736,7 @@ ${group('Appearance',`<label class="settings-row">Theme<select data-setting="the
+      <div class="font-sample"><div class="eyebrow">CURRENT APPLIED FONTS</div><div class="font-sample-chinese" lang="zh-Hans">子子子 春风又绿江南岸，明月何时照我还？</div><p class="subtle">样式测试 · 春天的雨，山中的路，朋友的信。</p></div>
+      <p class="subtle">When you apply, each checked custom font is downloaded if necessary, validated, and cached for offline use. If one is unavailable, an error offers to keep the previous fonts or upload the missing file. Font files are separate from learning backups.</p></div>
+    `)}${group('Master collection',`<div class="panel stack"><p>All ${MASTER.cards.length} bundled words and ${MASTER.grammar.length} sentences are provided by default. Your imported and edited entries persist across restarts.</p><p class="subtle">New bundled content is merged on the first launch after an app update, without overwriting your own entries. Keep exporting full progress backups regularly; browser storage is not a permanent independent backup.</p></div>
+-   `)}${group('Files & backups',`<div class="panel stack"><div class="notice ${backupNeeded()?'warning':''}">${backupNeeded()?'Changes are not confirmed in an exported backup.':'Your current progress is marked as backed up.'}</div>
++   `)}${group('Files & backups',`<div class="panel stack"><div class="notice ${backupNeeded()?'warning':''}">${backupNeeded()?'Changes are not confirmed in a backup.':'Your current progress is marked as backed up.'}</div>
+      <button class="btn btn-primary btn-full file-action-btn" data-action="backup"><span class="file-action-icon">${icon('download')}</span><span class="file-action-label">Export full progress backup</span></button>
+      <button class="btn btn-secondary btn-full file-action-btn" data-action="restore"><span class="file-action-icon">${icon('upload')}</span><span class="file-action-label">Restore full backup (preserve master content)</span></button>
+      <button class="btn btn-secondary btn-full file-action-btn" data-action="import-deck"><span class="file-action-icon">${icon('plus')}</span><span class="file-action-label">Load complete master file</span></button>
+@@ -748,7 +752,7 @@ ${group('Appearance',`<label class="settings-row">Theme<select data-setting="the
+      <button class="btn btn-danger" data-action="clear-dictionary">Clear dictionary</button>
+      <button class="btn btn-danger" data-action="reload-cards">Reload cards from default master</button></div>`)}
+    <div class="section-row"><h2 class="section-title">About Cíyán</h2></div>
+-   <div class="panel stack"><button class="btn btn-secondary" data-action="reload-app">Check for updates and reload</button><p class="lead" style="font-size:13px">Cíyán v${APP_VERSION} · Offline-first, local-only, independent skill schedules. No accounts, cloud sync, or background uploads.</p>
++   <div class="panel stack"><button class="btn btn-secondary" data-action="reload-app">Check for updates and reload</button><p class="lead" style="font-size:13px">Cíyán v${APP_VERSION} · Offline-first, independent skill schedules. Google Drive profiles synchronize while the app is active and connected; local data remains available offline.</p>
+      <p class="subtle">Browser data may be removed by iOS. Export after each session and keep the JSON in Files or iCloud Drive. Grammar usage risk reflects checked sentence attempts, with sample counts shown in sentence details.</p></div>`;
+ }
+ let lastStudyFocus='',lastScreen='';
+@@ -937,8 +941,8 @@ async function clearData(){
+ }
+ function backupModal(){pendingBackupRevision=null;
+   modal('Protect your progress',`<p class="lead" style="font-size:14px;margin-bottom:14px">This backup contains every word, grammar card, learning record, and setting. Save the JSON to your iPhone Files app or iCloud Drive.</p>
+-    <div class="notice warning" style="margin-bottom:13px">The app cannot verify you saved the file. Only confirm after you can find it in Files.</div>
+-    <div class="stack"><button class="btn btn-primary btn-full" data-action="share-backup">${icon('upload')}Save to Files (share sheet)</button>
++    <div class="notice warning" style="margin-bottom:13px">The app cannot verify you saved a manual export. Only confirm after you can find it in Files.</div>
++    <div class="stack">${currentProfile().remote?`<button class="btn btn-primary btn-full" data-action="sync-cloud-now">${icon('refresh')}Sync to Google Drive now</button><button class="btn btn-secondary btn-full" data-action="cloud-history">${icon('clock')}Browse cloud version history</button>`:''}<button class="btn btn-primary btn-full" data-action="share-backup">${icon('upload')}Save to Files (share sheet)</button>
+       <button class="btn btn-secondary btn-full" data-action="download-backup">${icon('download')}Download JSON instead</button>
+       <div id="backup-confirm-area"></div><p class="subtle">After sharing, choose Save to Files. If you use Download, find the JSON under Files → Downloads.</p></div>`);
+ }
+@@ -1108,6 +1112,8 @@ document.addEventListener('click',async event=>{
+     case 'delete-card':await deleteWord(element.dataset.id);break;
+     case 'delete-grammar':await deleteGrammar(element.dataset.id);break;
+     case 'backup':backupModal();break;
++    case 'sync-cloud-now':try{await syncNow();toast('Cloud synchronization requested. Check profile status for confirmation.');}catch(e){toast(e.message);}break;
++    case 'cloud-history':modal('Cloud version history','<div id="ciyan-cloud-history">Loading…</div>');try{await cloudHistory($('#ciyan-cloud-history'));}catch(e){toast(`Could not read history: ${e.message}`);}break;
+     case 'close-modal':closeModal();break;
+     case 'share-backup':await exportBackup('share');break;
+     case 'download-backup':await exportBackup('download');break;
+@@ -1254,6 +1260,7 @@ async function boot(){try{
+   // Load automatically downloaded or user-imported font bytes before verifying saved typography.
+   // A missing font library does not interfere with the independent study database.
+   try{await initializeFontLibrary();}catch(e){console.warn('Private font library unavailable:',e);}
++  await prepareCiyanProfile();
+   const loaded=await loadState();
+   // Existing local data must never be discarded because the app version changed.
+   // Creating a fresh state is valid only when no saved state exists. The user
+@@ -1292,6 +1299,20 @@ async function boot(){try{
+     await saveState(state,loaded?Number(loaded.revision)||0:null);
+   }
+   studyMode=state.activeGrammarSession?'grammar':'words';render();
++  if(typeof document.body?.appendChild==='function')installProfileUI({adapter:{
++    statusText:()=>syncLabel(),
++    beforeSwitch:async()=>{
++      if(saving)throw Error('A local save is still running');
++      if(!await reader.flush())throw Error('Reader progress could not be saved');
++      if(saving)throw Error('Pending writes are not complete');
++      const persisted=await loadState();if(persisted?.revision!==state.revision)throw Error('Local progress was not verified');
++      disconnectCiyanSync();
++    },
++    beforeDisconnect:async()=>{if(saving)throw Error('A local save is still running');},
++    onDisconnected:()=>disconnectCiyanSync(),
++    onCloudProfile:()=>startCiyanSync(()=>state)
++  }});
++  await startCiyanSync(()=>state);
+   if(fontError)fontUnavailableDialog(fontError.selected,fontError.validation);
+   if(state.activePractice&&!state.activePractice.current)void settlePractice();
+   if(navigator.storage?.persist)navigator.storage.persist().catch(()=>{});
+@@ -1642,3 +1663,5 @@ function feedbackStats(){
+  const chars=characterEvidence(state).slice(0,20),families=[...familyEvidence(state)].sort((a,b)=>b[1].errors-a[1].errors);
+  return `<section class="panel stack"><h2>Character recall</h2><p class="subtle">Weakest characters first, using the last 20 explicit grades with greater weight on recent attempts. Scores accumulate gradually across words. Unrated characters are unknown; no drawings are retained.</p>${chars.length?chars.map(x=>`<div class="stat-feedback-row"><strong>${esc(x.character)}</strong><span>${x.score==null?'Unscored':x.score.toFixed(2)} · ${(x.weakness*100).toFixed(0)}% weakness · ${x.total} ratings · ${x.words} words</span></div>`).join(''):'<p>No character feedback yet. Mark characters after revealing a drawing.</p>'}</section><section class="panel stack"><h2>Grammar families</h2><p class="subtle">Last 20 checked Particle Zoo answers per family. Errors modestly increase selection weight among eligible exercises; due cards still come first.</p>${families.length?families.map(([name,x])=>`<div class="stat-feedback-row"><strong>${esc(name)}</strong><span>${x.errors} errors / ${x.total} checked · ${Object.entries(x.types).map(([k,n])=>esc(k)+': '+n).join(' · ')}</span></div>`).join(''):'<p>Complete Particle Zoo exercises to see family feedback.</p>'}</section>`;
+ }
++
++window.addEventListener('ciyan-cloud-status',()=>{if(state&&page!=='reader')render();});
+diff --git a/backup-versions.js b/backup-versions.js
+index 0d03572..6983cac 100644
+--- a/backup-versions.js
++++ b/backup-versions.js
+@@ -1,12 +1,13 @@
+ // Backup format and app version are distinct. The former describes JSON shape;
+ // the latter selects explicitly ordered, content-aware transformations.
+-export const APP_VERSION='0.9.6';
++export const APP_VERSION='0.9.7';
+ 
+ // Add only intentional, reviewed transformations here in subsequent releases.
+ // Entries are adjacent application releases, including explicit identity steps.
+ // A v0.5.2 backup did not previously record appVersion, so this step is useful
+ // only for fixtures and for future versioned export compatibility tests.
+ const STEPS=new Map([
++ ['0.9.6',{next:'0.9.7',apply:document=>document}],
+  ['0.9.5',{next:'0.9.6',apply:document=>document}],
+  ['0.9.4',{next:'0.9.5',apply:document=>document}],
+  ['0.9.3',{next:'0.9.4',apply:document=>document}],
+diff --git a/cloud-profiles.js b/cloud-profiles.js
+new file mode 100644
+index 0000000..bfd67c7
+--- /dev/null
++++ b/cloud-profiles.js
+@@ -0,0 +1,129 @@
++import {readRegistry,currentProfile,forkProfile,selectProfile,upsertProfile,status,remoteProfiles,createRemoteProfile,displayStatus} from './shared/google-drive/src/profiles.js';
++import {ciyanDatabaseName,cloneCiyanData,ciyanHasData} from './shared/google-drive/src/local-data.js';
++import {getSyncCursor,setSyncCursor,createSyncScheduler,fetchRevision,downloadBackup,splitBackup} from './shared/google-drive/src/sync.js';
++import {chooseCiyanDatabase,loadState,saveState,makeBackup,parseBackup} from './storage.js';
++
++let scheduler=null,phase='local',lastError='';
++function cloudBackup(state){
++ const backup=makeBackup(state);
++ // Manual export status is not study data. Never hash moving wall-clock timestamps
++ // into cloud chunks; that would upload a new version for every no-op sync.
++ delete backup.state.lastBackupAt;
++ delete backup.state.backedUpRevision;
++ return backup;
++}
++const mark=(next,error='')=>{phase=next;lastError=error;window.dispatchEvent?.(new Event('ciyan-cloud-status'));};
++export const syncLabel=()=>phase==='synced'?'Synced':phase==='syncing'?'Syncing':phase==='error'?`Sync error${lastError?': '+lastError:''}`:phase==='offline'?'Offline':'Local';
++export const isUploading=()=>phase==='syncing';
++export const isSynced=()=>phase==='synced';
++export const cloudCurrentRevision=()=>currentProfile().remote?getSyncCursor(currentProfile().id,'ciyan')?.localRevision??-1:-1;
++
++async function replaceLocal(backup,expectedRevision=null){
++ const parsed=parseBackup(backup);if(!parsed.explicitDictionary&&(!parsed.cards.length||!parsed.grammar.length))throw Error('Cloud dictionary is incomplete');
++ // Unlike a standard import, profile replacement never merges current data or
++ // carries Azure credentials from a previous profile.
++ delete parsed.deviceKey;
++ await saveState(parsed,expectedRevision);
++ return parsed;
++}
++
++async function verifiedFork(sourceId,reason){
++ const name=`${currentProfile().name} (conflict ${new Date().toISOString().slice(0,10)})`;
++ const id=forkProfile(sourceId,name);
++ try{await cloneCiyanData(sourceId,id);}catch(e){throw Error(`Cannot preserve local edits as a profile fork: ${e.message}`);}
++ // A fork is local-only until the user explicitly uploads it. It cannot create
++ // repeated remote conflicts or change the remote revision by itself.
++ selectProfile(id);mark('conflict');window.alert(`A different cloud revision was confirmed. Local edits were safely forked as “${name}”. ${reason}`);
++ window.location.reload();
++ return id;
++}
++
++/** Called before Ciyan boot so a new remote profile is never initialized as empty. */
++export async function prepareCiyanProfile(){
++ const registry=readRegistry(),profile=currentProfile();chooseCiyanDatabase(ciyanDatabaseName(profile.id,registry));
++ let connected=false;
++ try{connected=!!(await status()).connected;}catch{}
++ if(!profile.remote||!connected){mark(profile.remote?'offline':'local');return;}
++ let remote;
++ try{remote=await fetchRevision(profile.id,'ciyan');}catch(e){
++  if(!(await ciyanHasData(profile.id)))throw Error('Cloud profile cannot be downloaded. Reconnect or go online; no empty profile was created.');
++  mark('offline',displayStatus(e));return;
++ }
++ const current=await loadState(),cursor=getSyncCursor(profile.id,'ciyan');
++ if(!remote.head){
++  if(cursor?.head)throw Error('Cloud history has disappeared. Local data was preserved. Resolve the cloud profile before syncing.');
++  mark('pending');return;
++ }
++ if(!current){
++  const snapshot=await downloadBackup(profile.id,'ciyan',remote.head);
++  const parsed=await replaceLocal(snapshot);setSyncCursor(profile.id,'ciyan',{head:remote.head.id,localRevision:parsed.revision,pendingOperationId:null});mark('synced');return;
++ }
++ if(cursor?.head===remote.head.id){mark('pending');return;}
++ if(cursor?.head&&cursor.head!==remote.head.id){
++  if(cursor.localRevision===current.revision){
++   const snapshot=await downloadBackup(profile.id,'ciyan',remote.head),parsed=await replaceLocal(snapshot,current.revision);
++   setSyncCursor(profile.id,'ciyan',{head:remote.head.id,localRevision:parsed.revision,pendingOperationId:null});mark('synced');return;
++  }
++  await verifiedFork(profile.id,'Your existing cloud copy was not overwritten.');return;
++ }
++ // A lost cursor is not proof of a conflict. Verify content before deciding.
++ const local=await splitBackup(cloudBackup(current));
++ if(JSON.stringify(local.sections)===JSON.stringify(remote.head.sections)){
++  setSyncCursor(profile.id,'ciyan',{head:remote.head.id,localRevision:current.revision,pendingOperationId:null});mark('synced');return;
++ }
++ // Never fork only because connection/cursor state was lost; require the user
++ // to choose explicitly when two independently established roots are found.
++ throw Error('This profile has local and cloud data but no common sync revision. Export a backup, then select which profile to keep. Nothing was changed.');
++}
++
++export async function startCiyanSync(readState){
++ scheduler?.stop();scheduler=null;
++ const profile=currentProfile();if(!profile.remote)return;
++ let online=false;try{online=!!(await status()).connected;}catch{}
++ if(!online){mark('offline');return;}
++ const clouds=(await remoteProfiles()).profiles;
++ if(!clouds.some(p=>p.id===profile.id)){mark('error','The cloud profile was not found');return;}
++ scheduler=createSyncScheduler({profileId:profile.id,appId:'ciyan',
++  readBackup:async()=>{const state=readState();return {backup:cloudBackup(state),revision:state.revision};},
++  onStatus:x=>{mark(x.phase,x.error?.message||'');},
++  onDivergence:async(result,input,cursor)=>{
++   // Re-fetch, and only fork if a different committed head is confirmed.
++   const checked=await fetchRevision(profile.id,'ciyan');
++   if(!checked.head||checked.head.id===cursor.head){mark('pending');return;}
++   // Content equality is not a fork even when another session updated metadata.
++   const equal=JSON.stringify((await splitBackup(input.backup)).sections)===JSON.stringify(checked.head.sections);
++   if(equal){setSyncCursor(profile.id,'ciyan',{head:checked.head.id,localRevision:input.revision,pendingOperationId:null});mark('synced');return;}
++   if(cursor.localRevision===input.revision&&readState().revision===input.revision){
++    const snapshot=await downloadBackup(profile.id,'ciyan',checked.head);
++    await replaceLocal(snapshot,input.revision);
++    setSyncCursor(profile.id,'ciyan',{head:checked.head.id,localRevision:parseBackup(snapshot).revision,pendingOperationId:null});location.reload();return;
++   }
++   await verifiedFork(profile.id,'You can later select the original cloud profile to retrieve its data.');
++  }
++ });
++ const cursor=getSyncCursor(profile.id,'ciyan');
++ if(cursor?.localRevision!==readState().revision||!cursor?.head)scheduler.changed();else mark('synced');
++}
++export const changedCiyanData=()=>scheduler?.changed();
++export const syncNow=async()=>{if(!scheduler)throw Error('Connect and select a Google Drive profile first');await scheduler.now();};
++export const disconnectCiyanSync=()=>{scheduler?.stop();scheduler=null;mark('offline');};
++export async function cloudHistory(container){
++ if(!container)return;const profile=currentProfile();if(!profile.remote){container.textContent='This is a local profile.';return;}
++ const {api}=await import('./shared/google-drive/src/profiles.js');const history=(await api(`/profiles/${profile.id}/apps/ciyan/history`)).history;
++ container.innerHTML='';if(!history.length){container.textContent='No cloud revisions yet.';return;}
++ for(const r of history){const button=document.createElement('button');button.className='pwa-profile-row';button.textContent=`${new Date(r.at).toLocaleString()} · ${r.id.slice(0,8)}`;
++  button.addEventListener('click',async()=>{
++   if(!confirm('Restore this complete Ciyan version? The current local data will first be copied to a separate safety profile.'))return;
++   try{
++    // Never delete the previous database before verifying that the download is valid.
++    const oldId=currentProfile().id;
++    const result=await api(`/profiles/${oldId}/apps/ciyan/revisions/${r.id}`);const backup=await downloadBackup(oldId,'ciyan',result.revision);
++    parseBackup(backup);
++    const safetyId=forkProfile(oldId,`${currentProfile().name} (before restore)`);
++    await cloneCiyanData(oldId,safetyId);
++    const old=await loadState();const cloudHead=await fetchRevision(oldId,'ciyan');await replaceLocal(backup,old?.revision??null);
++    setSyncCursor(oldId,'ciyan',{head:cloudHead.head?.id||null,localRevision:-1,pendingOperationId:null});location.reload();
++   }catch(e){alert(`Restore cancelled: ${e.message}`);}
++  });container.append(button);
++ }
++}
+diff --git a/index.html b/index.html
+index b93747f..788de3f 100644
+--- a/index.html
++++ b/index.html
+@@ -12,7 +12,7 @@
+   <link rel="icon" href="./icons/icon-192.png" />
+   <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+   <link rel="stylesheet" href="./styles.css" />
+-  <title>Cíyán v0.9.6</title>
++  <title>Cíyán v0.9.7</title>
+ </head>
+ <body>
+   <div class="background-glow glow-one"></div>
+diff --git a/package.json b/package.json
+index 9a1df38..0e75975 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "ciyan-mandarin-pwa",
+-  "version": "0.9.6",
++  "version": "0.9.7",
+   "private": true,
+   "type": "module",
+   "description": "Offline-first Mandarin learning PWA: standalone and AppLauncher module builds.",
+diff --git a/package.py b/package.py
+index 60ca7e0..639f8fd 100644
+--- a/package.py
++++ b/package.py
+@@ -22,7 +22,7 @@ STANDALONE_SHELL = (
+ STATIC_FILES = (
+     "styles.css", "app-host-bridge.js",
+     "app.js", "reader-core.js", "reader-boundaries.js", "reader-ui.js", "reader-editions.js", "reader-library.js", "speech-vault.js", "reader-guide.js", "reader-speech.js", "reader-cloud-speech.js", "chapter-download.js", "collection-reset.js",
+-    "backup-versions.js",
++    "backup-versions.js", "cloud-profiles.js",
+     "study-engine.js", "study-progress.js",
+     "tag-weights.js",
+     "grammar-context.js",
+@@ -45,6 +45,7 @@ STATIC_FILES = (
+     "hsk-tag-map.js",
+ )
+ STATIC_DIRS = ("icons", "chapters")
++PROFILE_SOURCE = ROOT / "shared" / "google-drive" / "src"
+ 
+ 
+ def main() -> None:
+@@ -63,6 +64,10 @@ def main() -> None:
+         shutil.copytree(ROOT / name, TARGET / name,
+                         ignore=shutil.ignore_patterns("graded-v091") if name == "chapters" else None)
+ 
++    if not PROFILE_SOURCE.is_dir():
++        raise FileNotFoundError("Missing PWA-GoogleDrive submodule; run git submodule update --init --recursive")
++    shutil.copytree(PROFILE_SOURCE, TARGET / "shared" / "google-drive" / "src", ignore=shutil.ignore_patterns("*.test.js"))
++
+     # The standalone build consumes the exact same application asset bytes,
+     # then layers on only its own entry point and PWA infrastructure.
+     if STANDALONE.exists():
+@@ -77,7 +82,7 @@ def main() -> None:
+     for file in shell:
+         digest.update(file.relative_to(STANDALONE).as_posix().encode() + b"\0")
+         digest.update(hashlib.sha256(file.read_bytes()).digest())
+-    cache = f"ciyan-shell-v0.9.6-{digest.hexdigest()[:16]}"
++    cache = f"ciyan-shell-v0.9.7-{digest.hexdigest()[:16]}"
+     paths = ["./" + file.relative_to(STANDALONE).as_posix() for file in shell]
+     template = (ROOT / "sw.standalone.template.js").read_text(encoding="utf-8")
+     worker = template.replace("__SHELL_CACHE_NAME__", cache).replace(
+diff --git a/shared/google-drive b/shared/google-drive
+new file mode 160000
+index 0000000..9e6d30d
+--- /dev/null
++++ b/shared/google-drive
+@@ -0,0 +1 @@
++Subproject commit 9e6d30d79278f07b8a85d41e3cb80f5990b82883
+diff --git a/storage.js b/storage.js
+index 8fc4cb5..6205caa 100644
+--- a/storage.js
++++ b/storage.js
+@@ -23,11 +23,17 @@ export function canonicalHSKTags(hanzi,tags){
+ }
+ export const DB_NAME='ciyan-mandarin';
+ const DB_VERSION=1, STORE='state';
++let activeDbName=DB_NAME;
+ let databasePromise;
++export function chooseCiyanDatabase(name){
++ if(typeof name!=='string'||!/^ciyan-mandarin(?:-profile-[A-Za-z0-9_-]{1,80})?$/.test(name))throw Error('Invalid profile database name');
++ if(activeDbName===name)return;
++ activeDbName=name;databasePromise=null;savedContent=null;savedHistory=null;savedReaderCatalog=new Map();
++}
+ function database(){
+   if(!('indexedDB' in globalThis))return Promise.reject(new Error('IndexedDB is not supported in this browser.'));
+   if(!databasePromise)databasePromise=new Promise((resolve,reject)=>{
+-    const request=indexedDB.open(DB_NAME,DB_VERSION);
++    const request=indexedDB.open(activeDbName,DB_VERSION);
+     request.onupgradeneeded=()=>{if(!request.result.objectStoreNames.contains(STORE))request.result.createObjectStore(STORE);};
+     request.onsuccess=()=>resolve(request.result);
+     request.onerror=()=>reject(request.error||new Error('Cannot open local database'));
+diff --git a/styles.css b/styles.css
+index 3900ae0..448f7da 100644
+--- a/styles.css
++++ b/styles.css
+@@ -756,3 +756,6 @@ html,body{touch-action:pan-x pan-y}
+ @keyframes ciyan-header-spin{to{transform:rotate(360deg)}}
+ @media(max-width:390px){.topbar .brand{gap:7px}.topbar .header-actions{gap:5px}.topbar .icon-btn{width:37px;height:40px;flex-basis:37px}.topbar .brand-version{font-size:9px}}
+ @media(prefers-reduced-motion:reduce){.topbar .pwa-updating svg{animation-duration:2s}}
++/* v0.9.7: profile control matches the fixed-width header actions. */
++.topbar .pwa-profile-button{border:1px solid var(--stroke);background:var(--paper);color:var(--ink);width:41px;height:41px;flex:0 0 41px;border-radius:15px}
++@media(max-width:390px){.topbar .pwa-profile-button{width:37px;height:40px;flex-basis:37px;border-radius:13px}}
+diff --git a/sw.standalone.template.js b/sw.standalone.template.js
+index 8d572ab..6ab120c 100644
+--- a/sw.standalone.template.js
++++ b/sw.standalone.template.js
+@@ -29,6 +29,8 @@ self.addEventListener('fetch',event=>{
+   if(event.request.method!=='GET')return;
+   const url=new URL(event.request.url);
+   if(url.origin!==self.location.origin)return;
++  // OAuth navigation and Drive API must ALWAYS reach the same-origin Worker.
++  if(url.pathname.startsWith('/_profiles/'))return;
+   if(event.request.mode==='navigate'){
+     const scope=new URL(self.registration.scope);
+     const index=new URL('./index.html',scope);
+diff --git a/tests/deployment-targets.test.js b/tests/deployment-targets.test.js
+index 70ac99d..39a3c74 100644
+--- a/tests/deployment-targets.test.js
++++ b/tests/deployment-targets.test.js
+@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
+ import { readFileSync } from 'node:fs';
+ const pkg=JSON.parse(readFileSync(new URL('../package.json',import.meta.url),'utf8'));
+ test('Ciyan builds an app-only static module for AppLauncher',()=>{
+- assert.equal(pkg.version,'0.9.6');
++ assert.equal(pkg.version,'0.9.7');
+  assert.equal(pkg.scripts.build,'python3 package.py');
+  const packager=readFileSync(new URL('../package.py',import.meta.url),'utf8');
+  assert.match(packager,/"app-host-bridge.js"/);
+diff --git a/tests/header-v096.test.js b/tests/header-v096.test.js
+index 2fdaefb..195cb48 100644
+--- a/tests/header-v096.test.js
++++ b/tests/header-v096.test.js
+@@ -4,8 +4,8 @@ import {readFileSync} from 'node:fs';
+ import {APP_VERSION} from '../backup-versions.js';
+ const src=readFileSync(new URL('../app.js',import.meta.url),'utf8');
+ const css=readFileSync(new URL('../styles.css',import.meta.url),'utf8');
+-test('v0.9.6 keeps the hosted home and standalone refresh mutually exclusive',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++test('v0.9.7 keeps the hosted home and standalone refresh mutually exclusive',()=>{
++ assert.equal(APP_VERSION,'0.9.7');
+  assert.match(src,/data-action="\$\{hosted\?'exit-to-launcher':'reload-app'\}"/);
+  assert.match(src,/icon\(hosted\?'home':'refresh'\)/);
+  assert.match(src,/aria-pressed="\$\{page==='settings'\}"/);
+diff --git a/tests/panlong-v095.test.js b/tests/panlong-v095.test.js
+index 3044216..ca4a5f8 100644
+--- a/tests/panlong-v095.test.js
++++ b/tests/panlong-v095.test.js
+@@ -70,7 +70,7 @@ test('v0.9.5 ships both frozen HSK5 and polished HSK6 graded editions aligned to
+ test('v0.9.5 identity migration preserves existing reader preferences, bookmarks and study records',()=>{
+  const sample={appVersion:'0.9.4',reader:{panlong:{chapters:[{editionPrefs:{graded:true,auto:true,minimum:.94},position:{id:'p1',offset:10}}],history:[{key:'term-林雷',grade:4}]}}};
+  const result=prepareVersionedBackup(sample);
+- assert.equal(result.appVersion,'0.9.6');
++ assert.equal(result.appVersion,'0.9.7');
+  assert.deepEqual(result.reader,sample.reader);
+  assert.equal(sample.appVersion,'0.9.4');
+ });
+diff --git a/tests/standalone-deployment.test.js b/tests/standalone-deployment.test.js
+index 8662ce6..a45bf4a 100644
+--- a/tests/standalone-deployment.test.js
++++ b/tests/standalone-deployment.test.js
+@@ -23,7 +23,7 @@ test('one build provides a standalone Worker bundle and a separate AppLauncher m
+   for(const shell of ['index.html','sw.js','manifest.webmanifest','standalone-boot.js','pwa-update.js'])
+     assert.equal(fs.existsSync(new URL(shell,modPath)),false,`host shell leaked into module: ${shell}`);
+   const html=read(standalonePath,'index.html');
+-  assert.match(html,/Cíyán v0\.9\.6/);
++  assert.match(html,/Cíyán v0\.9\.7/);
+   assert.match(html,/src="\.\/standalone-boot\.js"/);
+   assert.doesNotMatch(html,/My Workspace|launcher\.js|apps-registry/);
+   const manifest=JSON.parse(read(standalonePath,'manifest.webmanifest'));
+@@ -63,7 +63,7 @@ test('standalone updater uses its own SW, but launcher API remains authoritative
+ 
+ test('offline standalone cache refreshes on build changes without deleting reader content',()=>{
+   const code=read(standalonePath,'sw.js');
+-  assert.match(code,/ciyan-shell-v0\.9\.6-[a-f0-9]{16}/);
++  assert.match(code,/ciyan-shell-v0\.9\.7-[a-f0-9]{16}/);
+   assert.match(code,/"\.\/index\.html"/);
+   assert.match(code,/"\.\/app\.js"/);
+   assert.match(code,/"\.\/chapters\/index\.js"/);
+diff --git a/tests/ui-smoke.test.js b/tests/ui-smoke.test.js
+index dfff9bf..3890238 100644
+--- a/tests/ui-smoke.test.js
++++ b/tests/ui-smoke.test.js
+@@ -23,7 +23,10 @@ function mockBrowser() {
+   const shell={innerHTML:'',classList:{add(){},remove(){}}};
+   const toast={textContent:'',classList:{add(){},remove(){}}};
+   const browseNodes=Object.fromEntries(['#tag-filter','#active-tag-filter','#collection-list','#browse-count'].map(k=>[k,{innerHTML:'',textContent:''}]));
+-  const body={append(){}};
++  const body={append(){},style:{removeProperty(){}}};
++  const local=new Map(),session=new Map();
++  globalThis.localStorage={getItem:k=>local.get(k)||null,setItem:(k,v)=>local.set(k,String(v)),removeItem:k=>local.delete(k)};
++  globalThis.sessionStorage={getItem:k=>session.get(k)||null,setItem:(k,v)=>session.set(k,String(v)),removeItem:k=>session.delete(k)};
+   const fontStyles=new Map();
+   const fakeDb={
+     objectStoreNames:{contains:()=>true},
+@@ -49,7 +52,7 @@ function mockBrowser() {
+   globalThis.FontFace=class {constructor(family,src){this.family=family;this.src=src;this.status='unloaded';}async load(){this.status='loaded';return this;}};
+   globalThis.fetch=async url=>String(url).endsWith('mixed-fonts.css')?{ok:true,async text(){return fs.readFileSync(new URL('../mixed-fonts.css',import.meta.url),'utf8');}}:{ok:true,headers:{get(){return null;}},async arrayBuffer(){return new Uint8Array([0,1,0,0,65,66]).buffer;}};
+   Object.defineProperty(globalThis,'navigator',{value:{},configurable:true});
+-  globalThis.window={scrollTo(){},confirm:()=>true};
++  globalThis.window={scrollTo(){},confirm:()=>true,dispatchEvent(){},addEventListener(){}};
+   globalThis.location={protocol:'file:',href:'https://example.net/ciyan/?app=ciyan',assigned:null,reloaded:false,assign(url){this.assigned=url;},reload(){this.reloaded=true;}};
+   globalThis.history={replaceState(_data,_title,url){globalThis.location.href=String(url);}};
+   globalThis.__APP_LAUNCHER__={
+@@ -365,7 +368,7 @@ test('v0.5.4 preserves all local results and preferences when upgrading from v0.
+  // Upgrading may do one atomic content reconciliation, but must not touch
+  // old learning scores, history, user settings, custom IDs or definitions.
+  const reconciled=mock.data.get('main');
+- assert.equal(reconciled.bundledMasterVersion,'0.9.6');
++ assert.equal(reconciled.bundledMasterVersion,'0.9.7');
+  assert.deepEqual(reconciled.history,before.history);
+  assert.deepEqual(reconciled.grammarHistory,before.grammarHistory);
+  assert.deepEqual(reconciled.skillHistory,before.skillHistory);
+@@ -382,7 +385,7 @@ test('v0.5.4 preserves all local results and preferences when upgrading from v0.
+  const target={type:'number',value:'3',dataset:{setting:'newWordsPerDay'}};
+  await mock.listeners.change({target});await delay();
+  const saved=mock.data.get('main');
+- assert.equal(saved.appVersion,'0.9.6');assert.equal(saved.settings.newWordsPerDay,3);
++ assert.equal(saved.appVersion,'0.9.7');assert.equal(saved.settings.newWordsPerDay,3);
+  assert.equal(saved.settings.tagWeights['HSK/HSK1'],7);
+  assert.deepEqual(saved.settings.retryIntervals[2],before.settings.retryIntervals[2]);
+  assert.deepEqual(saved.schedules,before.schedules);
+@@ -396,7 +399,7 @@ test('v0.5.4 preserves all local results and preferences when upgrading from v0.
+ 
+ test('v0.5.4 creates clean defaults only when no saved state exists',async()=>{
+  const mock=mockBrowser();await import('../app.js?smoke=newInstallation054');await delay(35);
+- const saved=mock.data.get('main');assert.equal(saved.appVersion,'0.9.6');
++ const saved=mock.data.get('main');assert.equal(saved.appVersion,'0.9.7');
+  assert.equal(saved.cards.length,12505);assert.equal(saved.grammar.length,3444);
+  assert.equal(saved.history.length,0);
+ });
+diff --git a/tests/v053.test.js b/tests/v053.test.js
+index 5a419df..71dec59 100644
+--- a/tests/v053.test.js
++++ b/tests/v053.test.js
+@@ -11,9 +11,9 @@ test('v0.5.4 full backup embeds exact app version separately from backup format
+  assert.equal(s.appVersion,APP_VERSION);
+  const backup=makeBackup(s);
+  assert.equal(backup.format,'ciyan-backup');assert.equal(backup.version,2);
+- assert.equal(backup.appVersion,'0.9.6');assert.equal(backup.state.appVersion,APP_VERSION);
++ assert.equal(backup.appVersion,'0.9.7');assert.equal(backup.state.appVersion,APP_VERSION);
+  const result=parseBackup(JSON.parse(JSON.stringify(backup)));
+- assert.equal(result.appVersion,'0.9.6');
++ assert.equal(result.appVersion,'0.9.7');
+ });
+ 
+ test('versioned backup migration steps are sequential and do not touch unrelated settings',()=>{
+@@ -22,12 +22,12 @@ test('versioned backup migration steps are sequential and do not touch unrelated
+  const backup=makeBackup(s);backup.appVersion='0.5.2';backup.state.appVersion='0.5.2';
+  const before=structuredClone(backup.state);
+  const upgraded=prepareVersionedBackup(backup);
+- assert.equal(upgraded.appVersion,'0.9.6');assert.deepEqual(upgraded.state,before);
++ assert.equal(upgraded.appVersion,'0.9.7');assert.deepEqual(upgraded.state,before);
+  assert.equal(backup.appVersion,'0.5.2');
+  const parsed=parseBackup(backup);
+  assert.equal(parsed.settings.tagWeights['HSK/HSK1'],1);
+  assert.deepEqual(parsed.settings.retryIntervals,previousRetry);
+- assert.equal(parsed.appVersion,'0.9.6');
++ assert.equal(parsed.appVersion,'0.9.7');
+ });
+ 
+ test('unstamped legacy backup is accepted without guessing version-specific data edits',()=>{
+@@ -46,7 +46,7 @@ test('unsupported future, malformed and missing migration steps fail without mod
+   const fake={...backup,appVersion:input};assert.throws(()=>prepareVersionedBackup(fake));
+  }
+  assert.equal(normalizeAppVersion('v0.5.5'),'0.5.5');
+- assert.throws(()=>prepareVersionedBackup({...backup,appVersion:'0.9.7'}),/newer Cíyán/);
++ assert.throws(()=>prepareVersionedBackup({...backup,appVersion:'0.9.8'}),/newer Cíyán/);
+  assert.throws(()=>prepareVersionedBackup({...backup,appVersion:'0.5.1'}),/No supported backup migration/);
+  assert.deepEqual(backup,original);
+ });
+@@ -68,6 +68,6 @@ test('v0.5.3 through v0.5.5 are identity migrations of backup data',()=>{
+  const backup=makeBackup(s);backup.appVersion='0.5.3';backup.state.appVersion='0.5.3';
+  const before=structuredClone(backup.state),source=structuredClone(backup);
+  const migrated=prepareVersionedBackup(backup);
+- assert.equal(migrated.appVersion,'0.9.6');assert.deepEqual(migrated.state,before);
++ assert.equal(migrated.appVersion,'0.9.7');assert.deepEqual(migrated.state,before);
+  assert.deepEqual(backup,source);
+ });
+diff --git a/tests/v055.test.js b/tests/v055.test.js
+index a4257f6..eb2d429 100644
+--- a/tests/v055.test.js
++++ b/tests/v055.test.js
+@@ -12,7 +12,7 @@ const old=read('../content/v055_base_master.json'),additions=read('../content/v0
+ const cards=MASTER.cards,byId=new Map(cards.map(c=>[c.id,c])),byWord=new Map(cards.map(c=>[c.hanzi,c]));
+ 
+ test('v0.5.5 bundled master contains all words with unchanged old definitions, IDs, and all grammar',()=>{
+- assert.equal(APP_VERSION,'0.9.6');assert.ok(cards.length>=11760);assert.ok(MASTER.grammar.length>=1549);
++ assert.equal(APP_VERSION,'0.9.7');assert.ok(cards.length>=11760);assert.ok(MASTER.grammar.length>=1549);
+  assert.equal(byWord.size,cards.length);assert.equal(byId.size,cards.length);
+  const retained=old.grammar.filter(g=>MASTER.grammar.some(x=>x.id===g.id));assert.deepEqual(MASTER.grammar.slice(0,retained.length),retained);
+  for(const before of old.cards){const after=byWord.get(before.hanzi);assert.ok(after,before.hanzi);
+@@ -63,8 +63,8 @@ test('v0.5.4 backup migrations preserve all settings/history exactly',()=>{
+  const s=defaultState();s.settings.newWordsPerDay=17;s.settings.tagWeights['Food/food']=-1.2;
+  const backup=makeBackup(s);backup.appVersion='0.5.4';backup.state.appVersion='0.5.4';
+  const prev=structuredClone(backup.state),upgraded=prepareVersionedBackup(backup);
+- assert.deepEqual(upgraded.state,prev);assert.equal(upgraded.appVersion,'0.9.6');assert.equal(backup.appVersion,'0.5.4');
+- const restored=parseBackup(backup);assert.equal(restored.appVersion,'0.9.6');assert.equal(restored.settings.tagWeights['Food/food'],-1.2);
++ assert.deepEqual(upgraded.state,prev);assert.equal(upgraded.appVersion,'0.9.7');assert.equal(backup.appVersion,'0.5.4');
++ const restored=parseBackup(backup);assert.equal(restored.appVersion,'0.9.7');assert.equal(restored.settings.tagWeights['Food/food'],-1.2);
+ });
+ 
+ test('malformed synonym input fails validation rather than executing markup or corrupting links',()=>{
+diff --git a/tests/v061.test.js b/tests/v061.test.js
+index d7669a0..d284fdd 100644
+--- a/tests/v061.test.js
++++ b/tests/v061.test.js
+@@ -12,5 +12,5 @@ test('character grades pool across words, deduplicate repeats with weaker grade,
+ test('recent successful recall repairs old weakness; bounded weights and unknowns are neutral',()=>{const s=fixture();for(let i=0;i<10;i++)report(s,1);const before=characterEvidence(s)[0].weakness;for(let i=0;i<20;i++)report(s,4);const x=characterEvidence(s)[0];assert.ok(x.weakness<before);assert.equal(x.weakness,0);assert.equal(x.recentAttempts,20);assert.ok(x.score>3);const p=drawingProfile(s.cards[0],{score:3},new Map([[x.character,x]]));assert.equal(p.weight,1);assert.deepEqual(p.weakest,[]);});
+ test('word scores and shared weak characters both affect drawing selection, without bypassing gates or due dates',()=>{const s=fixture();report(s,1);const pool=candidates(s,'drawing',false,now);assert.ok(pool.find(x=>x.id==='b').urgency>pool.find(x=>x.id==='c').urgency);s.skillSchedules.drawing.b={...scheduleReview(null,3,now,s.settings),score:3};assert.ok(!candidates(s,'drawing',false,now).some(x=>x.id==='b'));s.schedules.a.score=1.99;assert.ok(!candidates(s,'drawing',false,now).some(x=>x.id==='a'));const p=drawingProfile(s.cards[0],{score:0},new Map(characterEvidence(s).map(x=>[x.character,x])));assert.ok(p.weight>1&&p.weight<3);assert.ok(p.weight>drawingProfile(s.cards[0],{score:3},new Map(characterEvidence(s).map(x=>[x.character,x]))).weight);});
+ test('due work remains ahead of new words even when new words share a weak character',()=>{const s=fixture();report(s,1);s.skillSchedules.drawing.c=scheduleReview(null,3,now-86400000,s.settings);const picked=nextExercise(s,{mode:'drawing',pool:'all'},now,()=>0);assert.equal(picked.id,'c');});
+-test('numeric grades survive preview backup upgrade and undo without archiving strokes',()=>{const s=fixture(),a={current:{mode:'drawing',id:'a'},input:{pads:[1],characterRatings:{0:'easy'}},spent:{},results:[]};rememberAnswer(s,a);recordExercise(s,a,3,{characters:[{character:'明',grade:4,rating:'easy'}]},now);const backup=makeBackup(s);backup.appVersion='0.6.0';const restored=parseBackup(backup);assert.equal(characterEvidence(restored)[0].score,.54);assert.equal(restored.appVersion,'0.9.6');undoAnswer(s,a);assert.equal(characterEvidence(s).length,0);assert.equal(a.input.pads,undefined);});
++test('numeric grades survive preview backup upgrade and undo without archiving strokes',()=>{const s=fixture(),a={current:{mode:'drawing',id:'a'},input:{pads:[1],characterRatings:{0:'easy'}},spent:{},results:[]};rememberAnswer(s,a);recordExercise(s,a,3,{characters:[{character:'明',grade:4,rating:'easy'}]},now);const backup=makeBackup(s);backup.appVersion='0.6.0';const restored=parseBackup(backup);assert.equal(characterEvidence(restored)[0].score,.54);assert.equal(restored.appVersion,'0.9.7');undoAnswer(s,a);assert.equal(characterEvidence(s).length,0);assert.equal(a.input.pads,undefined);});
+ test('invalid character grades cannot poison selection or create fake evidence',()=>{const s=fixture();s.skillHistory=[{mode:'drawing',characters:[{character:'明',grade:NaN},{character:'天',grade:8},{character:'xx',grade:1}]}];assert.deepEqual(characterEvidence(s),[]);});
+diff --git a/tests/v062.test.js b/tests/v062.test.js
+index d6ee508..89e74e9 100644
+--- a/tests/v062.test.js
++++ b/tests/v062.test.js
+@@ -64,5 +64,5 @@ test('master preserves all vocabulary IDs, tags and synonyms; prunes only named
+ test('0.6.1 backup upgrades to 0.6.2 without changing card scores or preferences',()=>{
+  const s=defaultState();replaceMaster(s,MASTER);s.schedules[s.cards[0].id]={...scheduleReview(null,3,Date.now(),s.settings),score:2.13};
+  s.settings.newWordsPerDay=57;const backup=makeBackup(s);backup.appVersion='0.6.1';
+- const restored=parseBackup(backup);assert.equal(restored.appVersion,'0.9.6');assert.equal(restored.schedules[s.cards[0].id].score,2.13);assert.equal(restored.settings.newWordsPerDay,57);
++ const restored=parseBackup(backup);assert.equal(restored.appVersion,'0.9.7');assert.equal(restored.schedules[s.cards[0].id].score,2.13);assert.equal(restored.settings.newWordsPerDay,57);
+ });
+diff --git a/tests/v064.test.js b/tests/v064.test.js
+index e80f87e..929df6c 100644
+--- a/tests/v064.test.js
++++ b/tests/v064.test.js
+@@ -9,9 +9,9 @@ import {MASTER} from '../master-data.js';
+ import {retrievability} from '../fsrs.js';
+ 
+ test('v0.6.4 preserves the v0.6.3 master and upgrades historical backups by identity',()=>{
+- assert.equal(APP_VERSION,'0.9.6');assert.equal(MASTER.cards.length,12505);assert.equal(MASTER.grammar.length,3444);
++ assert.equal(APP_VERSION,'0.9.7');assert.equal(MASTER.cards.length,12505);assert.equal(MASTER.grammar.length,3444);
+  const old={format:'ciyan-backup',version:2,appVersion:'0.6.3',state:{appVersion:'0.6.3',schemaVersion:2}};
+- const migrated=prepareVersionedBackup(old);assert.equal(migrated.appVersion,'0.9.6');
++ const migrated=prepareVersionedBackup(old);assert.equal(migrated.appVersion,'0.9.7');
+  assert.deepEqual(migrated.state,old.state);assert.equal(old.appVersion,'0.6.3');
+ });
+ 
+diff --git a/tests/v065.test.js b/tests/v065.test.js
+index 9b19664..56c1b2e 100644
+--- a/tests/v065.test.js
++++ b/tests/v065.test.js
+@@ -7,7 +7,7 @@ import {defaultState,resetConfirmationValid,makeBackup,parseBackup,migrateState,
+ import {MASTER} from '../master-data.js';
+ 
+ test('v0.6.5 preserves content and supports identity migration from the v0.6.4 release',()=>{
+- assert.equal(APP_VERSION,'0.9.6');assert.equal(MASTER.cards.length,12505);assert.equal(MASTER.grammar.length,3444);
++ assert.equal(APP_VERSION,'0.9.7');assert.equal(MASTER.cards.length,12505);assert.equal(MASTER.grammar.length,3444);
+  const old={format:'ciyan-backup',version:2,appVersion:'0.6.3',state:{appVersion:'0.6.3',schemaVersion:2}};
+  const migrated=prepareVersionedBackup(old);assert.equal(migrated.appVersion,APP_VERSION);
+  assert.deepEqual(migrated.state,old.state);
+diff --git a/tests/v066.test.js b/tests/v066.test.js
+index 5a98062..b9d3d64 100644
+--- a/tests/v066.test.js
++++ b/tests/v066.test.js
+@@ -8,10 +8,10 @@ import {MASTER} from '../master-data.js';
+ import {defaultState,parseBackup,makeBackup} from '../storage.js';
+ 
+ test('v0.6.6 version migration is identity-safe and all 3444 bundled grammar examples remain',()=>{
+- assert.equal(APP_VERSION,'0.9.6');assert.equal(MASTER.cards.length,12505);assert.equal(MASTER.grammar.length,3444);
++ assert.equal(APP_VERSION,'0.9.7');assert.equal(MASTER.cards.length,12505);assert.equal(MASTER.grammar.length,3444);
+  const old={format:'ciyan-backup',version:2,appVersion:'0.6.5',state:{appVersion:'0.6.5',schemaVersion:2,foo:11}};
+  const next=prepareVersionedBackup(old);
+- assert.equal(next.appVersion,'0.9.6');assert.deepEqual(next.state,old.state);
++ assert.equal(next.appVersion,'0.9.7');assert.deepEqual(next.state,old.state);
+ });
+ 
+ test('reconciliation is additive and preserves custom/edited words, grammar and learning data',()=>{
+diff --git a/tests/v067.test.js b/tests/v067.test.js
+index db3353d..3233ab9 100644
+--- a/tests/v067.test.js
++++ b/tests/v067.test.js
+@@ -8,8 +8,8 @@ import {defaultState,makeBackup,parseBackup} from '../storage.js';
+ import {scheduleReview,rescheduleExisting,previewOutcomes,retrySeconds,DEFAULT_RETRY} from '../review-scheduler.js';
+ 
+ test('v0.6.7 version and exact installed font names are exposed to users',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
+- assert.equal(prepareVersionedBackup({...makeBackup(defaultState()),appVersion:'0.6.6'}).appVersion,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
++ assert.equal(prepareVersionedBackup({...makeBackup(defaultState()),appVersion:'0.6.6'}).appVersion,'0.9.7');
+  const expected={xiaowei:'xiaowei',kuaile:'HappyZcool-2016',zhushi:'YRDZST',mashan:'Ma Shan Zheng',muyao:'Muyao-Softbrush',zhimang:'Zhi Mang Xing'};
+  for(const [id,alias] of Object.entries(expected)){
+   assert.equal(FONT_CATALOG[id].aliases[0],alias);
+diff --git a/tests/v068.test.js b/tests/v068.test.js
+index c942d63..09a829c 100644
+--- a/tests/v068.test.js
++++ b/tests/v068.test.js
+@@ -15,7 +15,7 @@ function fakeDocument(){
+  return doc;
+ }
+ test('v0.6.8 has exactly seven independent selectable fonts, including the standard iPhone font',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  assert.deepEqual(FONT_IDS,['print','xiaowei','kuaile','zhushi','mashan','muyao','zhimang']);
+  assert.equal(Object.keys(FONT_CATALOG).length,6);
+  assert.deepEqual(normalizeFontSettings({enabledFonts:[]}),{enabledFonts:[]});
+diff --git a/tests/v069.test.js b/tests/v069.test.js
+index bc213a1..923c8f6 100644
+--- a/tests/v069.test.js
++++ b/tests/v069.test.js
+@@ -13,7 +13,7 @@ function fakeDOM(){
+  return {doc,host:{replaceChild(fragment){this.fragment=fragment;}}};
+ }
+ test('v0.6.9 has one master scaler and seven independently tuned default font sizes',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  assert.equal(Object.keys(DEFAULT_FONT_SCALES).length,7);
+  assert.equal(DEFAULT_FONT_SCALES.print,1);
+  assert.ok(FONT_IDS.some(id=>id!=='print'&&DEFAULT_FONT_SCALES[id]!==1));
+@@ -72,5 +72,5 @@ test('full backups preserve checked fonts plus both scaler layers; v0.6.8 restor
+  delete older.state.settings.fontMasterScale;delete older.state.settings.fontScales;
+  const migrated=parseBackup(older);assert.deepEqual(migrated.settings.enabledFonts,['print','mashan']);
+  assert.equal(migrated.settings.fontMasterScale,1);assert.equal(migrated.settings.fontScales.mashan,DEFAULT_FONT_SCALES.mashan);
+- assert.equal(prepareVersionedBackup(older).appVersion,'0.9.6');
++ assert.equal(prepareVersionedBackup(older).appVersion,'0.9.7');
+ });
+diff --git a/tests/v078.test.js b/tests/v078.test.js
+index 85e9867..2f512c9 100644
+--- a/tests/v078.test.js
++++ b/tests/v078.test.js
+@@ -13,7 +13,7 @@ const fixture=JSON.parse(fs.readFileSync(new URL('../reader/panlong/chapters/001
+ const digest=createHash('sha256').update(fs.readFileSync(new URL('../reader/panlong/chapters/001.json',import.meta.url))).digest('hex');
+ 
+ test('twelve zero-padded TSK defaults; old personalized weights migrate intact',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  assert.deepEqual(Object.values(TSK_DEFAULTS),[2560,1280,640,320,160,80,40,20,10,5,2.5,1.25]);
+  assert.equal(defaultTagWeight('TSK/TSK05'),160);
+  assert.equal(defaultTagWeight('Topics/anything'),0);
+diff --git a/tests/v079.test.js b/tests/v079.test.js
+index 328a2b7..269f2b6 100644
+--- a/tests/v079.test.js
++++ b/tests/v079.test.js
+@@ -11,7 +11,7 @@ import {APP_VERSION,prepareVersionedBackup} from '../backup-versions.js';
+ 
+ const content=path=>fs.readFileSync(new URL(path,import.meta.url),'utf8');
+ test('v0.7.9 includes 11 linear Panlong chapters under V01; existing three digests unchanged',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  assert.equal(catalog.length,26);
+  const entries=catalog.filter(c=>c.novel==='panlong');
+  assert.deepEqual(entries.map(c=>c.number),Array.from({length:23},(_,i)=>i+1));
+@@ -96,5 +96,5 @@ test('custom author and volume metadata survive backup without adding new progre
+  assert.ok(!JSON.stringify(saved.reader).includes('paragraphs'));
+  assert.ok(!JSON.stringify(saved.readerCustomIndex).includes('tokens'));
+  const older=defaultState();older.appVersion='0.7.8';
+- assert.equal(prepareVersionedBackup(older).appVersion,'0.9.6');
++ assert.equal(prepareVersionedBackup(older).appVersion,'0.9.7');
+ });
+diff --git a/tests/v0810.test.js b/tests/v0810.test.js
+index 01acf07..c88fcec 100644
+--- a/tests/v0810.test.js
++++ b/tests/v0810.test.js
+@@ -13,7 +13,7 @@ const hsk=(c)=>c.tags.some(t=>t.startsWith('HSK/'));
+ const tag=(i)=>`TSK/TSK${String(i).padStart(2,'0')}`;
+ 
+ test('v0.8.10 supplies exactly twelve exclusive TSK tiers with 100 HSK and 100 outside HSK per tier',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  assert.equal(MASTER.cards.length,12505);
+  assert.equal(MASTER.grammar.length,3444);
+  const used=new Set();
+@@ -61,7 +61,7 @@ test('classification sync replaces old HSK/TSK without changing card identities,
+  s.history=[{cardId:known.id,at:'2026-11-20T00:00:00.000Z',grade:3}];
+  s.settings.tagWeights={'HSK/HSK1':12,'TSK/TSK1':777,'TSK/TSK9':3.5,'Food/food':-2};
+  const saved=makeBackup(s);saved.appVersion='0.8.9';saved.state.appVersion='0.8.9';
+- assert.equal(prepareVersionedBackup(saved).appVersion,'0.9.6');
++ assert.equal(prepareVersionedBackup(saved).appVersion,'0.9.7');
+  const restored=parseBackup(saved);
+  const beforeHistory=structuredClone(restored.history),beforeSchedule=structuredClone(restored.schedules[known.id]);
+  reconcileBundledMaster(restored,MASTER);
+diff --git a/tests/v0811.test.js b/tests/v0811.test.js
+index 0bd72ff..79b28bf 100644
+--- a/tests/v0811.test.js
++++ b/tests/v0811.test.js
+@@ -18,9 +18,9 @@ function reader(s,records){
+ function useQuota(s,b){const key=p.lexicon.vocabulary[0];assert.equal(gradeReader(s,b,key,3,Date.now()-2000),true);return key;}
+ 
+ test('v0811: clean version migration preserves 0.8.10 backups',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  const migrated=prepareVersionedBackup({format:'ciyan-backup',version:2,appVersion:'0.8.10',state:{sample:true}});
+- assert.equal(migrated.appVersion,'0.9.6');assert.deepEqual(migrated.state,{sample:true});
++ assert.equal(migrated.appVersion,'0.9.7');assert.deepEqual(migrated.state,{sample:true});
+ });
+ 
+ test('v0811: reaching the vocabulary quota blocks new terms and grammar across all reader scopes',async()=>{
+diff --git a/tests/v0812.test.js b/tests/v0812.test.js
+index ef33484..c1117ad 100644
+--- a/tests/v0812.test.js
++++ b/tests/v0812.test.js
+@@ -57,8 +57,8 @@ test('v0.8.12: grammar uses constituent vocabulary tag union for all three modes
+ });
+ 
+ test('v0.8.12: v0.8.11 backups migrate without modifying user data',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  const prior={format:'ciyan-backup',version:2,appVersion:'0.8.11',state:{history:[{id:1}],filters:{tags:{Food:1}}}};
+  const result=prepareVersionedBackup(prior);
+- assert.equal(result.appVersion,'0.9.6');assert.deepEqual(result.state,prior.state);
++ assert.equal(result.appVersion,'0.9.7');assert.deepEqual(result.state,prior.state);
+ });
+diff --git a/tests/v0814.test.js b/tests/v0814.test.js
+index 2fac898..df6647d 100644
+--- a/tests/v0814.test.js
++++ b/tests/v0814.test.js
+@@ -4,10 +4,10 @@ import {readFileSync} from 'node:fs';
+ import {APP_VERSION,prepareVersionedBackup} from '../backup-versions.js';
+ 
+ test('Ciyan v0.9.2 retains lossless earlier backup upgrades',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  const data={appVersion:'0.8.13',state:{cards:[{id:'custom',english:'my word'}],revision:77}};
+  const upgraded=prepareVersionedBackup(data);
+- assert.equal(upgraded.appVersion,'0.9.6');
++ assert.equal(upgraded.appVersion,'0.9.7');
+  assert.deepEqual(upgraded.state,data.state);
+ });
+ 
+diff --git a/tests/v085.test.js b/tests/v085.test.js
+index 077eda8..d0e022b 100644
+--- a/tests/v085.test.js
++++ b/tests/v085.test.js
+@@ -5,7 +5,7 @@ import {APP_VERSION} from '../backup-versions.js';
+ import {defaultState,migrateState,speechPreferences} from '../storage.js';
+ 
+ test('v0.8.5 bounds expensive Azure prefetch and cache values, including restored backups',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  assert.equal(speechPreferences({}).speechPreload,2);
+  assert.equal(speechPreferences({}).speechCacheLimit,8);
+  assert.deepEqual(
+diff --git a/tests/v086.test.js b/tests/v086.test.js
+index 93c5942..f909b52 100644
+--- a/tests/v086.test.js
++++ b/tests/v086.test.js
+@@ -5,10 +5,10 @@ import {APP_VERSION,prepareVersionedBackup} from '../backup-versions.js';
+ import {makeBackup,defaultState} from '../storage.js';
+ 
+ test('v0.8.6 backup migration retains v0.8.5 data without modifications',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  const old=makeBackup(defaultState()); old.appVersion='0.8.5';
+  const next=prepareVersionedBackup(old);
+- assert.equal(next.appVersion,'0.9.6');
++ assert.equal(next.appVersion,'0.9.7');
+  assert.deepEqual(next.state,old.state);
+ });
+ test('Ciyan keeps drawing touch gestures isolated from browser scroll',()=>{
+diff --git a/tests/v087.test.js b/tests/v087.test.js
+index 0506845..a726b98 100644
+--- a/tests/v087.test.js
++++ b/tests/v087.test.js
+@@ -12,7 +12,7 @@ const load=n=>JSON.parse(read(`chapters/${String(n).padStart(3,'0')}.json`));
+ const digest=data=>createHash('sha256').update(data).digest('hex');
+ 
+ test('v0.8.9 retains all Panlong chapter text with upgraded lexicon and grammar metadata',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  assert.equal(catalog.length,26);
+  assert.deepEqual(catalog.filter(x=>x.novel==='panlong').map(x=>x.number),Array.from({length:23},(_,i)=>i+1));
+  for(let n=12;n<=23;n++){
+@@ -90,7 +90,7 @@ test('all new ZIP packages inflate to the exact integrity-checked original JSON'
+ test('old v0.8.6 backups migrate through an identity step without changing progress',()=>{
+  const previous={format:'ciyan-backup',version:2,appVersion:'0.8.6',state:{reader:{panlong:{current:11,chapters:[],history:[{key:'term-林雷',grade:3}],progress:{}}}}};
+  const upgraded=prepareVersionedBackup(previous);
+- assert.equal(upgraded.appVersion,'0.9.6');assert.deepEqual(upgraded.state,previous.state);
++ assert.equal(upgraded.appVersion,'0.9.7');assert.deepEqual(upgraded.state,previous.state);
+ });
+ test('chapter study prompt has independent length-aware typography and safe wrapping',()=>{
+  const reader=fs.readFileSync(new URL('../reader-ui.js',import.meta.url),'utf8');
+diff --git a/tests/v088.test.js b/tests/v088.test.js
+index 23a4267..a840a71 100644
+--- a/tests/v088.test.js
++++ b/tests/v088.test.js
+@@ -10,7 +10,7 @@ const progress=(s,session)=>sessionDueProgress(s,session,now);
+ const due=(minutes=0)=>({score:2,intervalMinutes:60,lastReviewedAt:'2026-11-19T08:00:00.000Z',dueAt:new Date(now+minutes*60000).toISOString()});
+ 
+ test('v0.8.8 progress renders only Due when the new-vocabulary cap is unlimited',()=>{
+- assert.equal(APP_VERSION,'0.9.6');
++ assert.equal(APP_VERSION,'0.9.7');
+  const html=studyProgressMarkup({done:2,total:5},43,null);
+  assert.match(html,/study-mini-label">Due/);
+  assert.doesNotMatch(html,/study-mini-label">New/);
+@@ -79,7 +79,7 @@ test('v0.8.7 backups migrate by identity into v0.8.8',()=>{
+  const backup=makeBackup(state);backup.appVersion='0.8.7';backup.state.appVersion='0.8.7';
+  const original=structuredClone(backup.state);
+  const migrated=prepareVersionedBackup(backup);
+- assert.equal(migrated.appVersion,'0.9.6');assert.deepEqual(migrated.state,original);
++ assert.equal(migrated.appVersion,'0.9.7');assert.deepEqual(migrated.state,original);
+  assert.equal(parseBackup(backup).settings.newWordsPerDay,7);
+ });
+ 
+diff --git a/worker.js b/worker.js
+new file mode 100644
+index 0000000..d9790ca
+--- /dev/null
++++ b/worker.js
+@@ -0,0 +1,10 @@
++/** Same-origin profile API gateway for standalone Ciyan. */
++export default {
++  async fetch(request,env){
++    if(new URL(request.url).pathname.startsWith('/_profiles/')){
++      if(!env.PROFILES)return new Response('Profile service binding missing',{status:503});
++      return env.PROFILES.fetch(request);
++    }
++    return env.ASSETS.fetch(request);
++  }
++};
+diff --git a/wrangler.jsonc b/wrangler.jsonc
+index 27a4be8..23fab16 100644
+--- a/wrangler.jsonc
++++ b/wrangler.jsonc
+@@ -4,5 +4,7 @@
+   "name": "ciyan",
+   "compatibility_date": "2026-11-19",
+   "workers_dev": true,
+-  "assets": { "directory": "./dist/standalone" }
++  "main": "./worker.js",
++  "services": [{ "binding": "PROFILES", "service": "pwa-profiles-api" }],
++  "assets": { "directory": "./dist/standalone", "binding": "ASSETS" }
+ }
+-- 
+2.47.3
+

@@ -33,7 +33,7 @@ if [ -f "$PROFILE" ]; then
         /^# BEGIN iSH-Scripts aliases$/ { managed=1; next }
         /^# END iSH-Scripts aliases$/ { managed=0; next }
         managed { next }
-        /^[[:space:]]*alias[[:space:]]+(syncapps|syncapp|gamp)=/ { next }
+        /^[[:space:]]*alias[[:space:]]+(syncapps|syncapp|gamp|pwacloud)=/ { next }
         { line[++n]=$0 }
         END {
             while (n > 0 && line[n] ~ /^[[:space:]]*$/) n--
@@ -47,6 +47,7 @@ fi
     printf 'alias syncapps=\047sh "%s/sync-apps.sh"\047\n' "$ALIASES"
     printf 'alias syncapp=\047sh "%s/sync-app.sh"\047\n' "$ALIASES"
     printf 'alias gamp=\047sh "%s/git-apply-push.sh"\047\n' "$ALIASES"
+    printf 'alias pwacloud=\047sh "%s/GoogleCloud/gc.sh"\047\n' "$ROOT"
     printf '# END iSH-Scripts aliases\n'
 } >> "$TMP"
 
@@ -61,6 +62,6 @@ trap - 0
     awk '/^[[:space:]]*alias[[:space:]]+/ { print }' "$PROFILE"
 } > "$OUTPUT"
 
-printf 'Registered syncapps, syncapp, and gamp in %s\n' "$PROFILE"
+printf 'Registered syncapps, syncapp, gamp, and pwacloud in %s\n' "$PROFILE"
 printf 'Alias snapshot: %s\n' "$OUTPUT"
 printf 'To activate in this terminal: . "%s"\n' "$PROFILE"

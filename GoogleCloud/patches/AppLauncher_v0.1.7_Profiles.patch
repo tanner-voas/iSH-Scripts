@@ -1,0 +1,289 @@
+From 2577c12a4b3a3aaa6ed2aa1156cd4c48c4568965 Mon Sep 17 00:00:00 2001
+From: OpenAI <oai@example.invalid>
+Date: Mon, 23 Nov 2026 04:50:54 +0000
+Subject: [PATCH] AppLauncher v0.1.7: shared profile manager and coordinated
+ submodule updates
+
+---
+ .github/workflows/update-ciyan.yml | 38 +++++++++++++++++-------------
+ .gitmodules                        |  3 +++
+ build.py                           | 10 +++++++-
+ launcher.js                        |  7 +++++-
+ package.json                       |  2 +-
+ shared/google-drive                |  1 +
+ sw.template.js                     |  2 ++
+ tests/failure-isolation.test.js    |  4 ++--
+ tests/launcher.test.js             |  2 +-
+ worker.js                          | 10 ++++++++
+ workspace.css                      |  4 ++++
+ wrangler.jsonc                     |  4 +++-
+ 12 files changed, 63 insertions(+), 24 deletions(-)
+ create mode 160000 shared/google-drive
+ create mode 100644 worker.js
+
+diff --git a/.github/workflows/update-ciyan.yml b/.github/workflows/update-ciyan.yml
+index ec0f815..4fec1a6 100644
+--- a/.github/workflows/update-ciyan.yml
++++ b/.github/workflows/update-ciyan.yml
+@@ -1,16 +1,13 @@
+-name: Update Ciyan submodule
++name: Update Ciyan and shared Google Drive pointers
+ on:
+   repository_dispatch:
+     types: [ciyan-updated]
+   workflow_dispatch:
+-
+ permissions:
+   contents: write
+-
+ concurrency:
+   group: update-app-submodules
+   cancel-in-progress: false
+-
+ jobs:
+   advance-ciyan:
+     runs-on: ubuntu-latest
+@@ -19,24 +16,31 @@ jobs:
+         with:
+           submodules: false
+           persist-credentials: true
+-      - name: Advance pinned Ciyan commit
++      - name: Advance Ciyan and align shared profile library in ONE commit
+         env:
+-          EXPECTED_SHA: ${{ github.event.client_payload.sha }}
++          NOTIFIED_SHA: ${{ github.event.client_payload.sha }}
+         shell: bash
+         run: |
+           set -euo pipefail
+-          git submodule update --init -- apps/ciyan
++          git submodule update --init -- apps/ciyan shared/google-drive
+           git -C apps/ciyan fetch origin main
+-          ACTUAL_SHA="$(git -C apps/ciyan rev-parse FETCH_HEAD)"
+-          if [[ -n "$EXPECTED_SHA" && "$EXPECTED_SHA" != "$ACTUAL_SHA" ]]; then
+-            echo "Newer Ciyan commit $ACTUAL_SHA supersedes notification for $EXPECTED_SHA"
++          CIYAN_SHA="$(git -C apps/ciyan rev-parse FETCH_HEAD)"
++          if [[ -n "$NOTIFIED_SHA" && "$NOTIFIED_SHA" != "$CIYAN_SHA" ]]; then
++            echo "Newer Ciyan $CIYAN_SHA supersedes $NOTIFIED_SHA"
+           fi
+-          git -C apps/ciyan checkout --detach "$ACTUAL_SHA"
+-          if git diff --quiet -- apps/ciyan; then
+-            echo "Submodule already up to date"; exit 0
++          git -C apps/ciyan checkout --detach "$CIYAN_SHA"
++          # Use the Ciyan gitlink, never race a second independent shared update.
++          SHARED_SHA="$(git -C apps/ciyan rev-parse 'HEAD:shared/google-drive')"
++          git -C shared/google-drive fetch origin main
++          if ! git -C shared/google-drive cat-file -e "$SHARED_SHA^{commit}"; then
++            git -C shared/google-drive fetch origin "$SHARED_SHA"
+           fi
+-          git config user.name "github-actions[bot]"
+-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+-          git add apps/ciyan
+-          git commit -m "build: update Ciyan submodule to ${ACTUAL_SHA:0:12}"
++          git -C shared/google-drive checkout --detach "$SHARED_SHA"
++          if git diff --quiet -- apps/ciyan shared/google-drive; then
++            echo 'Both dependency pointers are already aligned'; exit 0
++          fi
++          git config user.name 'github-actions[bot]'
++          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
++          git add apps/ciyan shared/google-drive
++          git commit -m "build: align Ciyan ${CIYAN_SHA:0:12} and profiles ${SHARED_SHA:0:12}"
+           git push origin HEAD:main
+diff --git a/.gitmodules b/.gitmodules
+index db3bc62..c1aee7d 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -10,3 +10,6 @@
+ 	path = apps/ascendant
+ 	url = https://github.com/tanner-voas/Ascendant.git
+ 	branch = main
++[submodule "shared/google-drive"]
++	path = shared/google-drive
++	url = https://github.com/tanner-voas/PWA-GoogleDrive.git
+diff --git a/build.py b/build.py
+index 8ee02ba..57e827b 100644
+--- a/build.py
++++ b/build.py
+@@ -17,7 +17,7 @@ from pathlib import Path
+ 
+ ROOT=Path(__file__).resolve().parent
+ TARGET=ROOT/'dist'
+-RESERVED={'index.html','launcher.js','apps-registry.js','launcher-meta.js','pwa-update.js',
++RESERVED={'shared-profiles','worker.js','index.html','launcher.js','apps-registry.js','launcher-meta.js','pwa-update.js',
+           'viewport-lock.js','sw.js','manifest.webmanifest','_headers','workspace.css'}
+ HOST_FILES=['index.html','launcher.js','workspace.css','pwa-update.js',
+             'viewport-lock.js','manifest.webmanifest','_headers']
+@@ -48,6 +48,11 @@ def safe_failure(exc):
+ def package_app(app):
+     source=ROOT/safe_rel(app['source'])
+     prepare_submodule(source)
++    # Ciyan pins the same shared library as its own nested submodule. Ensure
++    # Cloudflare builds have initialized it even when they only cloned depth 1.
++    if app['id']=='ciyan' and (source/'.git').exists():
++        subprocess.run(['git','submodule','update','--init','--recursive'],cwd=source,
++                       check=True,timeout=150)
+     subprocess.run([sys.executable,'package.py'],cwd=source,check=True,timeout=300)
+     assets=source/safe_rel(app.get('distribution',f'dist/{app["id"]}'))
+     if not assets.is_dir():raise RuntimeError('Missing app distribution')
+@@ -117,6 +122,9 @@ def build():
+     TARGET.mkdir(parents=True)
+     for f in HOST_FILES:shutil.copy2(ROOT/f,TARGET/f)
+     shutil.copytree(ROOT/'icons',TARGET/'icons')
++    source=ROOT/'shared'/'google-drive'/'src'
++    if not source.is_dir():raise RuntimeError('Missing PWA-GoogleDrive submodule')
++    shutil.copytree(source,TARGET/'shared-profiles')
+     registry=[]
+     for app in apps:
+         entry={k:app[k] for k in ('id','name','glyph','module','stylesheet')}
+diff --git a/launcher.js b/launcher.js
+index b7ba53b..767fb98 100644
+--- a/launcher.js
++++ b/launcher.js
+@@ -1,4 +1,5 @@
+ import {runUpdateButton} from './pwa-update.js';
++const profileButton='<button type="button" class="pwa-profile-button" data-pwa-profile-button aria-label="Manage profile" title="Manage profile"><svg viewBox="0 0 24 24" width="23" height="23" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4.5 21c0-5 3.2-8 7.5-8s7.5 3 7.5 8"/></svg></button>';
+ import {APPS} from './apps-registry.js';
+ import {LAUNCHER_VERSION} from './launcher-meta.js';
+ 
+@@ -30,7 +31,7 @@ export function homeScreen(current){
+     return `<a class="launcher-tile" data-launch-app="${id}" href="${appLaunchUrl(current,app.id)}" aria-label="Open ${name}">${common}<span class="launcher-tile-version">v${escapeHtml(app.version)}</span></a>`;
+   }).join('');
+   return `<div class="launcher-screen"><header class="launcher-header"><div class="launcher-heading"><img class="launcher-brand-icon" src="./icons/icon-192.png" alt=""><h1 class="launcher-workspace-title">My Workspace <small class="launcher-version">v${LAUNCHER_VERSION}</small></h1></div>
+-    <button type="button" class="launcher-refresh icon-btn" data-update-launcher aria-label="Check for updates and reload" title="Check for updates and reload">
++    ${profileButton}<button type="button" class="launcher-refresh icon-btn" data-update-launcher aria-label="Check for updates and reload" title="Check for updates and reload">
+       <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14-5L3 9V3m0 6h6M4 13a8 8 0 0 0 14 5l3-3v6m0-6h-6"/></svg>
+     </button></header>
+     <nav class="launcher-grid" aria-label="Applications">${tiles}</nav>
+@@ -111,6 +112,7 @@ function registerWorker(){
+ 
+ export async function startLauncher(){
+   registerWorker();
++
+   const id=activeAppId(location.href);
+   if(id){
+     const selected=APPS.find(app=>app.id===id);
+@@ -124,11 +126,14 @@ export async function startLauncher(){
+   renderHome();
+ }
+ 
++let profileUI=null;
+ function renderHome(){
+   document.title='My Workspace';
+   document.body.classList.add('launcher-mode');
+   const host=document.querySelector('#app');
+   host.innerHTML=homeScreen(location.href);
++  // Lazy import: launcher URL utilities remain usable in isolated test/build fixtures.
++  if(!profileUI)void import('./shared-profiles/ui.js').then(m=>{if(!profileUI)profileUI=m.installProfileUI();}).catch(e=>console.warn('Profile UI unavailable:',e));
+   host.addEventListener('click',event=>{
+     const refresh=event.target.closest?.('[data-update-launcher]');
+     if(refresh){
+diff --git a/package.json b/package.json
+index 38eeecf..8336d6c 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "app-launcher",
+-  "version": "0.1.6",
++  "version": "0.1.7",
+   "private": true,
+   "type": "module",
+   "scripts": {
+diff --git a/shared/google-drive b/shared/google-drive
+new file mode 160000
+index 0000000..9e6d30d
+--- /dev/null
++++ b/shared/google-drive
+@@ -0,0 +1 @@
++Subproject commit 9e6d30d79278f07b8a85d41e3cb80f5990b82883
+diff --git a/sw.template.js b/sw.template.js
+index 32aa76f..3738308 100644
+--- a/sw.template.js
++++ b/sw.template.js
+@@ -32,6 +32,8 @@ self.addEventListener('fetch', event => {
+   if(event.request.method !== 'GET')return;
+   const url=new URL(event.request.url);
+   if(url.origin!==self.location.origin)return;
++  // OAuth navigation and Drive API must ALWAYS reach the same-origin Worker.
++  if(url.pathname.startsWith('/_profiles/'))return;
+   if(event.request.mode==='navigate'){
+     const scope=new URL(self.registration.scope);
+     const index=new URL('./index.html',scope);
+diff --git a/tests/failure-isolation.test.js b/tests/failure-isolation.test.js
+index eb719d2..b17e97b 100644
+--- a/tests/failure-isolation.test.js
++++ b/tests/failure-isolation.test.js
+@@ -16,7 +16,7 @@ function fakeApp(dir,name,fails=false){
+ test('a failed app and absent submodule do not block a healthy app or service worker',async()=>{
+  const temp=fs.mkdtempSync(path.join(os.tmpdir(),'wg-launcher-test-'));
+  try{
+-  for(const p of ['build.py','index.html','launcher.js','workspace.css','pwa-update.js','viewport-lock.js','sw.template.js','manifest.webmanifest','_headers','package.json','icons'])copy(p,temp);
++  for(const p of ['build.py','index.html','launcher.js','workspace.css','pwa-update.js','viewport-lock.js','sw.template.js','manifest.webmanifest','_headers','package.json','icons','shared/google-drive/src'])copy(p,temp);
+   const app=name=>({id:name,name, glyph:name[0],source:`apps/${name}`,destination:`apps/${name}`,distribution:`dist/${name}`,module:`./apps/${name}/app.js`,stylesheet:`./apps/${name}/styles.css`});
+   fs.writeFileSync(path.join(temp,'apps.json'),JSON.stringify({apps:[app('good'),app('broken'),app('missing')]}));
+   fakeApp(temp,'good');fakeApp(temp,'broken',true);
+@@ -45,7 +45,7 @@ test('a failed app and absent submodule do not block a healthy app or service wo
+ test('tile artwork is copied from the source app and missing artwork fails only that app',()=>{
+  const temp=fs.mkdtempSync(path.join(os.tmpdir(),'wg-launcher-art-test-'));
+  try{
+-  for(const p of ['build.py','index.html','launcher.js','workspace.css','pwa-update.js','viewport-lock.js','sw.template.js','manifest.webmanifest','_headers','package.json','icons'])copy(p,temp);
++  for(const p of ['build.py','index.html','launcher.js','workspace.css','pwa-update.js','viewport-lock.js','sw.template.js','manifest.webmanifest','_headers','package.json','icons','shared/google-drive/src'])copy(p,temp);
+   const app=name=>({id:name,name,glyph:'◇',source:`apps/${name}`,destination:`apps/${name}`,distribution:`dist/${name}`,module:`./apps/${name}/app.js`,stylesheet:`./apps/${name}/styles.css`,tile_icon:'icons/icon-192.png'});
+   fs.writeFileSync(path.join(temp,'apps.json'),JSON.stringify({apps:[app('art'),app('missing-art')]}));
+   fakeApp(temp,'art');fakeApp(temp,'missing-art');
+diff --git a/tests/launcher.test.js b/tests/launcher.test.js
+index 28562bd..8e1b9d4 100644
+--- a/tests/launcher.test.js
++++ b/tests/launcher.test.js
+@@ -73,7 +73,7 @@ test('PWA identity, viewport lock and app storage survive migration',()=>{
+ 
+ test('service worker generates a unique content hash and caches the launcher and app',()=>{
+   const script=read('sw.js');
+-  assert.match(script,/app-launcher-shell-v0\.1\.6-[a-f0-9]{16}/);
++  assert.match(script,/app-launcher-shell-v0\.1\.7-[a-f0-9]{16}/);
+   assert.match(script,/"\.\/index\.html"/);
+   if(APPS[0].version!=='0.8.16')assert.match(script,/"\.\/app-host-bridge\.js"/);
+   assert.match(script,/"\.\/master-data\.js"/);
+diff --git a/worker.js b/worker.js
+new file mode 100644
+index 0000000..dba45b7
+--- /dev/null
++++ b/worker.js
+@@ -0,0 +1,10 @@
++/** Same-origin profile API gateway. No OAuth secrets are stored in AppLauncher. */
++export default {
++  async fetch(request,env){
++    if(new URL(request.url).pathname.startsWith('/_profiles/')){
++      if(!env.PROFILES)return new Response('Profile service binding missing',{status:503});
++      return env.PROFILES.fetch(request);
++    }
++    return env.ASSETS.fetch(request);
++  }
++};
+diff --git a/workspace.css b/workspace.css
+index 58e97bf..74b6cda 100644
+--- a/workspace.css
++++ b/workspace.css
+@@ -70,3 +70,7 @@ svg.ico{width:20px;height:20px;stroke:currentColor;stroke-width:1.8;fill:none;st
+ .launcher-brand-icon{width:39px;height:39px;flex:0 0 39px;border-radius:12px;display:block}
+ .launcher-workspace-title{display:flex;align-items:baseline;flex-wrap:nowrap;gap:6px;white-space:nowrap;font-size:clamp(19px,5vw,28px);letter-spacing:-.7px}
+ .launcher-workspace-title .launcher-version{font-size:10px;letter-spacing:0;white-space:nowrap}
++/* v0.1.7: shared profile control beside the far-right refresh control. */
++.launcher-header .pwa-profile-button{margin-left:auto;background:var(--paper);border:1px solid var(--stroke);color:var(--ink);width:42px;height:42px;flex:0 0 42px;border-radius:14px}
++.launcher-header{gap:8px}.launcher-header .launcher-heading{margin-right:auto}
++@media(max-width:390px){.launcher-workspace-title{font-size:18px}.launcher-brand-icon{width:34px;height:34px;flex-basis:34px}}
+diff --git a/wrangler.jsonc b/wrangler.jsonc
+index af3f144..3f3814b 100644
+--- a/wrangler.jsonc
++++ b/wrangler.jsonc
+@@ -4,5 +4,7 @@
+   "name": "applauncher",
+   "compatibility_date": "2026-11-19",
+   "workers_dev": true,
+-  "assets": { "directory": "./dist" }
++  "main": "./worker.js",
++  "services": [{ "binding": "PROFILES", "service": "pwa-profiles-api" }],
++  "assets": { "directory": "./dist", "binding": "ASSETS" }
+ }
+-- 
+2.47.3
+
