@@ -54,7 +54,7 @@ fi
 
 git -C "$BASE/Beta" checkout -q -- tracked.txt
 
-# Untracked files survive; untracked patches are deliberately deleted.
+# Untracked files and uncommitted patches must survive a successful sync.
 printf 'keep\n' > "$BASE/Alpha/untracked.txt"
 printf 'temporary patch\n' > "$BASE/Alpha/obsolete.patch"
 sh "$ROOT/scripts/aliases/sync-apps.sh" >"$TMP/out" 2>&1 || {
@@ -63,7 +63,7 @@ sh "$ROOT/scripts/aliases/sync-apps.sh" >"$TMP/out" 2>&1 || {
 [ -f "$BASE/Alpha/another.txt" ] || exit 1
 [ -f "$BASE/Beta/another.txt" ] || exit 1
 [ "$(cat "$BASE/Alpha/untracked.txt")" = keep ] || exit 1
-[ ! -e "$BASE/Alpha/obsolete.patch" ] || exit 1
+[ "$(cat "$BASE/Alpha/obsolete.patch")" = "temporary patch" ] || exit 1
 
 # Local commits never get discarded.
 printf 'locally committed\n' > "$BASE/Alpha/local.txt"
@@ -85,4 +85,4 @@ if sh "$ROOT/scripts/aliases/sync-app.sh" Beta >"$TMP/out" 2>&1; then
 fi
 [ "$(cat "$BASE/Beta/conflict.txt")" = 'my untracked data' ] || exit 1
 
-echo 'PASS: dirty guard, preflight, untracked protection, patch cleanup, local commits.'
+echo 'PASS: dirty guard, preflight, untracked protection, patch preservation, local commits.'

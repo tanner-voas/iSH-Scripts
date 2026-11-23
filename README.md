@@ -16,7 +16,7 @@ terminal with `. ~/.profile`; new iSH login shells read the profile normally.
 - `syncapp REPO` — safely syncs one repository using its path relative to `/mnt/wcopy/apps/`, from any current directory.
 - `gamp` — runs `git am *.patch && git push && rm *.patch` in the current directory.
 
-Sync refuses to overwrite staged or unstaged tracked changes (including deletions) and refuses to discard local commits or operate on branches other than `main`. Untracked files are normally preserved. If an untracked file would be overwritten by a remote change, Git refuses the fast-forward. After a successful sync, **untracked root-level `.patch` files are deleted**; tracked patches remain untouched.
+Sync refuses to overwrite staged or unstaged tracked changes (including deletions) and refuses to discard local commits or operate on branches other than `main`. Untracked files are normally preserved. If an untracked file would be overwritten by a remote change, Git refuses the fast-forward. After a successful sync, **untracked `.patch` files are preserved**; only `gamp` cleans up patches it successfully applies. The new commit SHA is printed after each update.
 
 `syncapps` intentionally skips AppLauncher submodules and processes `iSH-Scripts` itself as a top-level repository. GitHub/Cloudflare can still initialize AppLauncher submodules during builds.
 

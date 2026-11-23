@@ -94,15 +94,9 @@ update_remote() {
     # fast-forwardable, but refuses untracked filename collisions.
     git -C "$repo" -c submodule.recurse=false merge --ff-only refs/remotes/origin/main || return 1
 
-    # Preserve tracked patches. Delete only loose (untracked) root-level patches.
-    for patch in "$repo"/*.patch; do
-        [ -f "$patch" ] || continue
-        filename="${patch##*/}"
-        if git -C "$repo" ls-files --error-unmatch -- "$filename" >/dev/null 2>&1; then
-            continue
-        fi
-        rm -f -- "$patch" || return 1
-    done
+    # Never remove or alter unapplied .patch files. They may contain user work.
+    # `gamp` is responsible for deleting only the patches it actually applied.
+    echo "UPDATED $name: $(git -C "$repo" rev-parse --short=12 HEAD)"
     echo "SUCCESS: $name"
 }
 
