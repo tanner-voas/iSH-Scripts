@@ -1,0 +1,14 @@
+name: Tag main history
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * *'
+permissions:
+  contents: write
+jobs:
+  tags:
+    uses: ./.github/workflows/tag-reusable.yml
+    with:
+      tool-ref: ${{ github.sha }}

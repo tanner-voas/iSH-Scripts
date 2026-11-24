@@ -23,6 +23,7 @@ cmp "$ISH_PROFILE_FILE" "$TMP/first-run" || { echo 'FAIL: not idempotent' >&2; e
 
 [ "$(grep -c '^alias syncapps=' "$ISH_PROFILE_FILE")" = 1 ]
 [ "$(grep -c '^alias syncapp=' "$ISH_PROFILE_FILE")" = 1 ]
+[ "$(grep -c '^alias tagapps=' "$ISH_PROFILE_FILE")" = 1 ]
 [ "$(grep -c '^alias gamp=' "$ISH_PROFILE_FILE")" = 1 ]
 grep -Fq "alias other='echo unchanged'" "$ISH_PROFILE_FILE"
 grep -Fq "$ROOT/scripts/aliases/sync-apps.sh" "$ISH_PROFILE_FILE"

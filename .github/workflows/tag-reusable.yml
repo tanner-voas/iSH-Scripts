@@ -1,0 +1,38 @@
+name: Synchronize version tags
+on:
+  workflow_call:
+    inputs:
+      tool-ref:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  tags:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: version-tags-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          path: target
+      - uses: actions/checkout@v4
+        with:
+          repository: tanner-voas/iSH-Scripts
+          ref: ${{ inputs.tool-ref }}
+          path: tag-tools
+          persist-credentials: false
+      - name: Append missing main-history tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            git -C target fetch --no-tags origin main
+            git -C target reset --hard FETCH_HEAD
+            if sh tag-tools/scripts/tag-versions.sh --repo target; then exit 0; fi
+            sleep 2
+          done
+          exit 1

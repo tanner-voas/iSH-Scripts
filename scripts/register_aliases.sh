@@ -8,7 +8,7 @@ ALIASES="$ROOT/scripts/aliases"
 PROFILE="${ISH_PROFILE_FILE:-${HOME:?HOME is not set}/.profile}"
 OUTPUT="$ROOT/current_aliases.txt"
 
-for name in sync-apps.sh sync-app.sh git-apply-push.sh; do
+for name in sync-apps.sh sync-app.sh git-apply-push.sh tag-apps.sh; do
     if [ ! -f "$ALIASES/$name" ]; then
         echo "Missing alias script: $ALIASES/$name" >&2
         exit 1
@@ -33,7 +33,7 @@ if [ -f "$PROFILE" ]; then
         /^# BEGIN iSH-Scripts aliases$/ { managed=1; next }
         /^# END iSH-Scripts aliases$/ { managed=0; next }
         managed { next }
-        /^[[:space:]]*alias[[:space:]]+(syncapps|syncapp|gamp)=/ { next }
+        /^[[:space:]]*alias[[:space:]]+(syncapps|syncapp|gamp|tagapps)=/ { next }
         { line[++n]=$0 }
         END {
             while (n > 0 && line[n] ~ /^[[:space:]]*$/) n--
@@ -47,6 +47,7 @@ fi
     printf 'alias syncapps=\047sh "%s/sync-apps.sh"\047\n' "$ALIASES"
     printf 'alias syncapp=\047sh "%s/sync-app.sh"\047\n' "$ALIASES"
     printf 'alias gamp=\047sh "%s/git-apply-push.sh"\047\n' "$ALIASES"
+    printf 'alias tagapps=\047sh "%s/tag-apps.sh"\047\n' "$ALIASES"
     printf '# END iSH-Scripts aliases\n'
 } >> "$TMP"
 
@@ -61,6 +62,6 @@ trap - 0
     awk '/^[[:space:]]*alias[[:space:]]+/ { print }' "$PROFILE"
 } > "$OUTPUT"
 
-printf 'Registered syncapps, syncapp, and gamp in %s\n' "$PROFILE"
+printf 'Registered syncapps, syncapp, gamp, and tagapps in %s\n' "$PROFILE"
 printf 'Alias snapshot: %s\n' "$OUTPUT"
 printf 'To activate in this terminal: . "%s"\n' "$PROFILE"

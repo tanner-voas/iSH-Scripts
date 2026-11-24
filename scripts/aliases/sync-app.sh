@@ -82,7 +82,7 @@ check_remote() {
 
 fetch_remote() {
     echo "Fetching $name..."
-    git -C "$repo" -c fetch.recurseSubmodules=false fetch --all || return 1
+    git -C "$repo" -c fetch.recurseSubmodules=false fetch --all --no-tags --prune || return 1
     check_remote
 }
 
